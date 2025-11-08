@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 import triton
 import triton.language as tl
-from examples.common.utils import read_realtime
 
 import sys
 import os
@@ -70,7 +69,7 @@ def alltoalldispatch_preamble(
         device_id = exp // (NUM_EXPERTS // EP_SIZE)
 
         ## Extract the count. ##
-        ptrs = tl.arange(2)+pid
+        ptrs = tl.arange(0,2)+pid
         
         meta_vals = tl.load(META+ptrs,mask=ptrs<N+1)
 
@@ -258,12 +257,12 @@ def gen_tensor(
 
     ## We first do a common load tensor. ##
     assert (batch*seq) % num_experts == 0, 'must be evenly divisible'
-    meta = torch.tensor([(batch*seq) // num_experts for _ in range(num_experts)]).to("cuda" if torch.cuda.is_availabel() else "cpu")
+    meta = torch.tensor([(batch*seq) // num_experts for _ in range(num_experts)]).to("cuda" if torch.cuda.is_available() else "cpu")
 
     return tokens, meta
 
 def callee(
-    batch: int, seq: int, hidden_dim: int, num_experts: int,
+    rank: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
     world_size: int
     ):
     """
@@ -272,9 +271,16 @@ def callee(
     Tokens: [cnt, hidden dimension]-sized tensor representing the input tokens to this layer.
     meta: num_experts sized tensor representing the number of tokens routed to expert_i.
     """
+    device_id = rank % torch.cuda.device_count()
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        init_method="tcp://127.0.0.1:29500",
+        device_id=torch.device(f"cuda:{device_id}")
+    )
     heap_size = 2**30 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
-    rank = dist.get_rank()
     tokens, meta = gen_tensor(batch, seq, hidden_dim, world_size, num_experts, rank)
 
     device_cnts = torch.zeros(world_size).to(tokens.device)
@@ -287,7 +293,7 @@ def callee(
     ##   to instantiate buffer sizes.
     alltoalldispatch_preamble[(num_experts,1,1)](
         tokens, device_cnts, meta_cumsum, NUMS_flag, shmem.get_heap_bases(), 
-        dist.get_rank(), world_size, num_experts, tokens.shape[0], world_size // num_experts
+        dist.get_rank(), world_size, num_experts, tokens.shape[0], num_experts // world_size 
     ) 
 
     ## Let's print device_cnts at the end. ##
@@ -306,9 +312,12 @@ def callee(
         ## Call the persistent Gemm here that does the MLP compute. ##
         pass
 
+    shmem.barrier()
+    dist.destroy_process_group()
+
 if __name__ == "__main__":
     ## Input parameters. ##
     world_size, batch, seq, hidden_dim = 2, 2, 2, 4  
     num_experts = world_size * 2
     ## A custom test case for convenience. ##
-    mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, ), nprocs=world_size, join=True)
+    mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size), nprocs=world_size, join=True)
