@@ -36,7 +36,7 @@ def callee(
         device_id=torch.device(f"cuda:{device_id}")
     )
 
-    heap_size = (2**30)*5 ## 1 GiB symmetric heap.
+    heap_size = (2**30)*18 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
 
     tokens, meta = gen_tensor(
@@ -84,8 +84,8 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim = 8, 8, 2048, 1024
+    world_size, batch, seq, hidden_dim = 8, 8, 65536, 1024
     num_experts = world_size * 2
-    run_custom_a2a: bool = False 
+    run_custom_a2a: bool = True 
     ## A custom test case for convenience. ##
     mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, run_custom_a2a), nprocs=world_size, join=True)
