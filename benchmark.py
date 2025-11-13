@@ -86,7 +86,7 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim, topk = 8, 4, 128, 1024, 2
+    world_size, batch, seq, hidden_dim, topk = 8, 4, 1024, 1024, 8
     num_experts = world_size * 2  ## Two experts per device. ##
     run_custom_a2a: bool = False 
     ## A custom test case for convenience. ##
