@@ -39,7 +39,7 @@ def callee(
     heap_size = (2**30)*18 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
 
-    tokens = gen_tensor(
+    tokens, chunk_size = gen_tensor(
         batch, seq, hidden_dim, 
         world_size, num_experts, 
         rank, topk)
@@ -56,7 +56,7 @@ def callee(
         else:
             ## Currently meta is an empty list. Will be required for uneven all-to-all later. ##
             TorchA2A(
-                rank, tokens, [], batch,
+                rank, tokens, chunk_size, batch,
                 seq, hidden_dim, num_experts,
                 world_size, False, shmem
                 )
@@ -73,7 +73,7 @@ def callee(
                 )
         else:
             TorchA2A(
-                rank, tokens, [], batch,
+                rank, tokens, chunk_size, batch,
                 seq, hidden_dim, num_experts,
                 world_size, False, shmem
                 )
@@ -86,7 +86,7 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim, topk = 8, 8, 4096, 1024, 2
+    world_size, batch, seq, hidden_dim, topk = 8, 4, 128, 1024, 2
     num_experts = world_size * 2  ## Two experts per device. ##
     run_custom_a2a: bool = False 
     ## A custom test case for convenience. ##

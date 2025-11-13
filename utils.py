@@ -1,11 +1,14 @@
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 def gen_tensor(
     batch: int, seq: int, hidden_dim: int, 
     world_size: int, num_experts: int, 
     rank: int, topk: int) -> tuple[torch.tensor, torch.tensor]:
+
     torch.manual_seed(rank)
+    assert num_experts % world_size == 0, "Incorrect EP_SIZE, world_size should evenly divide num_experts."
 
     tokens = torch.rand(batch*seq, hidden_dim, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
     router = torch.randn(hidden_dim, num_experts, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
@@ -13,6 +16,7 @@ def gen_tensor(
     routed_values = F.softmax(torch.einsum('bh, he -> be', tokens, router), dim=-1)
     top_vals, top_idxs = torch.topk(routed_values, topk)
 
+    ## This is very incorrect when it comes to chunking. ## --> Something is going wrong here.
     expert_tokens = []
     for ex in range(num_experts):
         mask = (top_idxs == ex).any(dim=-1)
@@ -20,18 +24,37 @@ def gen_tensor(
         if tkns.numel() > 0:
             expert_tokens.append(tkns)
         else:
-            expert_tokens.append(torch.zeros(1, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu"))
+            tmp_tkns = torch.zeros(1, hidden_dim, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
+            expert_tokens.append(tmp_tkns)
 
     ## Next, we pad to the largest element-sized tensor.
     max_tkn_cnt = max([i.shape[0] for i in expert_tokens])
 
-    expert_tokens = [F.pad(i, (0, max_tkn_cnt - i.shape[0]), "constant", 0) for i in expert_tokens]
+    ## We exchange this between devices. ##
+    global_max = torch.tensor([max_tkn_cnt], dtype=torch.int32).to("cuda" if torch.cuda.is_available() else "cpu")
+    dist.all_reduce(global_max, dist.ReduceOp.MAX)
+    print(f'[rank: {rank}]: global_max_tkn_cnt: {global_max.item()}')
 
-    return expert_tokens
+    expert_tokens = [torch.cat(
+        (i, torch.zeros(global_max.item() - i.shape[0], hidden_dim, dtype=tokens.dtype).to(tokens.device))
+    ) for i in expert_tokens]
 
-    ## Then, we send over.
-    ## We first do a common load tensor. ##
-    #assert (batch*seq) % num_experts == 0, 'must be evenly divisible'
-    #meta = torch.tensor([(batch*seq) // num_experts for _ in range(num_experts)]).to("cuda" if torch.cuda.is_available() else "cpu")
+    ## Lastly, we have to coalesce for the all-to-all. ##
+    coalesced_experts = torch.cat(expert_tokens, dim=0)
 
-    return expert_tokens 
+    expert_per_device = num_experts // world_size
+
+    #coalesced_experts = []
+    #for i in range(world_size):
+    #    curr_tensor = None
+    #    for j in range(expert_per_device):
+    #        if curr_tensor is not None:
+    #            curr_tensor = torch.cat(
+    #                (curr_tensor, expert_tokens[i*expert_per_device+j])
+    #            )
+    #        else:
+    #            curr_tensor = expert_tokens[i*expert_per_device+j]
+
+    #    coalesced_experts.append(curr_tensor)
+
+    return coalesced_experts, global_max.item()*expert_per_device 
