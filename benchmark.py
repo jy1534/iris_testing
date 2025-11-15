@@ -36,7 +36,7 @@ def callee(
         device_id=torch.device(f"cuda:{device_id}")
     )
 
-    heap_size = (2**30)*18 ## 1 GiB symmetric heap.
+    heap_size = (2**30)*100 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
 
     tokens, chunk_size = gen_tensor(
@@ -44,12 +44,14 @@ def callee(
         world_size, num_experts, 
         rank, topk)
 
+    if rank == 0:
+        print(f'[rank: {rank}], chunk_size: {chunk_size}')
     ## Warmup. ##
     for _ in range(5):
         if opt:
             ## Currently meta is an empty list. Will be required for uneven all-to-all later. ##
             CustomA2A(
-                rank, tokens, [], batch, 
+                rank, tokens, chunk_size, batch, 
                 seq, hidden_dim, num_experts, 
                 world_size, shmem, False
                 )
@@ -67,7 +69,7 @@ def callee(
     for _ in range(10):
         if opt:
             CustomA2A(
-                rank, tokens, [], batch, 
+                rank, tokens, chunk_size, batch, 
                 seq, hidden_dim, num_experts, 
                 world_size, shmem, False
                 )
@@ -86,8 +88,8 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim, topk = 8, 4, 1024, 1024, 8
-    num_experts = world_size * 2  ## Two experts per device. ##
+    world_size, batch, seq, hidden_dim, topk = 8, 4, 1024, 768, 2
+    num_experts = world_size * 32  ## Multiple experts per device, evenly distributed. ##
     run_custom_a2a: bool = False 
     ## A custom test case for convenience. ##
     mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, topk, run_custom_a2a), nprocs=world_size, join=True)

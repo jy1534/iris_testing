@@ -62,17 +62,4 @@ def gen_tensor(
 
     expert_per_device = num_experts // world_size
 
-    #coalesced_experts = []
-    #for i in range(world_size):
-    #    curr_tensor = None
-    #    for j in range(expert_per_device):
-    #        if curr_tensor is not None:
-    #            curr_tensor = torch.cat(
-    #                (curr_tensor, expert_tokens[i*expert_per_device+j])
-    #            )
-    #        else:
-    #            curr_tensor = expert_tokens[i*expert_per_device+j]
-
-    #    coalesced_experts.append(curr_tensor)
-
     return coalesced_experts, global_max.item()*expert_per_device 

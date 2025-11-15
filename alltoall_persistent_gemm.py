@@ -80,7 +80,7 @@ def alltoalldispatch_preamble(
 @triton.jit
 def alltoalldispatch_main(
     routed_token_buffer, input_dev_tokens, 
-    DATA_flag, stride_am, stride_ak, heap_bases, 
+    DATA_flag, LOCAL_flag, stride_am, stride_ak, heap_bases, 
     token_cnt: tl.constexpr, outgoing_buffer_size: tl.constexpr,
     hidden_dim: tl.constexpr, transmit_size: tl.constexpr, 
     cur_rank: tl.constexpr, world_size: tl.constexpr,
@@ -91,52 +91,91 @@ def alltoalldispatch_main(
     routed_token_buffer -> the array of tokens that we paste into (tokens come from other devices)
     input_dev_tokens -> the array of tokens currently residing on this device.
     DATA_flag -> unit-sized array that will determine when comms have finished.
+    LOCAL_flag -> world_size-sized array that will determine when it is safe to increment DATA_flag.
     transmit_size -> number of tokens from Device A -> B per message (we fix this for ease of implementation).
     cur_rank -> self-explanatory.
     """
 
-    pid = tl.program_id(0)
-    device_id = pid
-    num_progs = tl.num_programs(0)
-    tl.device_assert(transmit_size % BLOCK_SIZE == 0)
+    ## We need to change the parallelism here to make it amenable for larger scale benchmarking. ##
 
-    non_local_ptrs = tl.arange(0, BLOCK_SIZE)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + cur_rank * transmit_size * stride_am
-    ptrs = tl.arange(0, BLOCK_SIZE)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + device_id * transmit_size * stride_am
+    pid = tl.program_id(1)
+    device_id = tl.program_id(0)
 
-    for iter in tl.range(tl.cdiv(transmit_size, BLOCK_SIZE)):
+    non_local_ptrs = cur_rank * transmit_size * stride_am + pid * stride_am + tl.arange(0, BLOCK_SIZE)[None, :] * stride_ak
+
+    ptrs = pid * stride_am + device_id * transmit_size * stride_am + tl.arange(0, BLOCK_SIZE)[None, :] * stride_ak 
+
+    for iter in tl.range(tl.cdiv(hidden_dim, BLOCK_SIZE)):
         iris.put(
             input_dev_tokens + ptrs,
             routed_token_buffer + non_local_ptrs,
             cur_rank,
             device_id,
             heap_bases,
-            mask=tl.arange(0, BLOCK_SIZE)[:, None] + cur_rank < outgoing_buffer_size, 
+            mask=tl.arange(0, BLOCK_SIZE)[None, :] + iter * BLOCK_SIZE < hidden_dim, 
             )
 
-        non_local_ptrs += BLOCK_SIZE * stride_am
-        ptrs += BLOCK_SIZE * stride_am
-    
-    ## We have to incr the atomic flag only once at the end once the shift is successful. ##
-    iris.atomic_add(
-        DATA_flag,
+        non_local_ptrs += BLOCK_SIZE * stride_ak 
+        ptrs += BLOCK_SIZE * stride_ak
+
+    #iris.atomic_add(
+    #    LOCAL_flag + device_id,
+    #    1,
+    #    cur_rank,
+    #    cur_rank,
+    #    heap_bases,
+    #    mask=None,
+    #    sem="release",
+    #    scope="sys"
+    #)
+
+    tl.atomic_add(
+        LOCAL_flag + device_id,
         1,
-        cur_rank,
-        device_id,
-        heap_bases,
-        mask=None,
-        sem="release",
-        scope="sys" 
+        sem="release"
     )
 
+    if pid == 0:
+        ## One block spin-locks until it is safe to atomically increment the global array flag. ##
+        #result = 0
+        #while result < transmit_size:
+        #    compare, value = transmit_size, transmit_size
+        #    result = iris.atomic_cas(
+        #        LOCAL_flag + device_id,
+        #        compare,
+        #        value,
+        #        cur_rank,
+        #        cur_rank,
+        #        heap_bases,
+        #        sem="acquire",
+        #        scope="sys"
+        #    ) 
+
+        ## This seems to be buggy. ##
+        while tl.load(LOCAL_flag + device_id) != transmit_size:
+            pass
+    
+        ## We have to incr the atomic flag only once at the end once the shift is successful. ##
+        iris.atomic_add(
+            DATA_flag,
+            1,
+            cur_rank,
+            device_id,
+            heap_bases,
+            mask=None,
+            sem="release",
+            scope="sys" 
+        )
+
 def run(
-    rank: int, tokens: torch.tensor, meta: torch.tensor, batch: int, seq: int, hidden_dim: int, num_experts: int,
+    rank: int, tokens: torch.tensor, transmit_size: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
     world_size: int, shmem, general_a2a: bool 
 ):
     """
     This is the callee function for the Shmem-based all-to-all + gemm kernels.
 
     Tokens: [cnt, hidden dimension]-sized tensor representing the input tokens to this layer.
-    meta: num_experts sized tensor representing the number of tokens routed to expert_i.
+    transmit_size: num_experts sized tensor representing the number of tokens routed to expert_i.
     general_a2a: Flag to trigger unbalanced a2a capability, currently not working.
     """
     device_id = rank % torch.cuda.device_count()
@@ -158,17 +197,18 @@ def run(
     else:
         ## For now, we fix a fix sized buffer to transmit over, otherwise things get far too complicated.
         assert tokens.shape[0] % world_size == 0, 'Tensor sizes not properly shaped.'
-        transmit_size = tokens.shape[0] // world_size 
         routed_token_buffer = shmem.zeros(transmit_size * world_size, tokens.shape[-1], dtype=tokens.dtype, device="cuda")
+        assert routed_token_buffer.shape[-1] == tokens.shape[-1], 'incorrect tensor sizes for source/dest buffers.'
         DATA_flag = shmem.zeros(world_size, device="cuda")
+        LOCAL_flag = torch.zeros(world_size, dtype=torch.int32).to(tokens.device)
         outgoing_buffer_size = transmit_size * world_size
 
     s1 = torch.cuda.Stream()
     s2 = torch.cuda.Stream()
     ## Now, we launch the main all-to-all kernel + persistent gemm. ##
     with torch.cuda.stream(s1):
-        alltoalldispatch_main[(world_size,1,1)](
-            routed_token_buffer, tokens, DATA_flag,
+        alltoalldispatch_main[(world_size,transmit_size,1)](
+            routed_token_buffer, tokens, DATA_flag, LOCAL_flag,
             tokens.stride(0), tokens.stride(1), shmem.get_heap_bases(), 
             tokens.shape[0], transmit_size * world_size, 
             tokens.shape[-1], transmit_size, rank, 
@@ -178,6 +218,5 @@ def run(
         ## Call the persistent Gemm here that does the MLP compute. ##
         NUM_REM_SMS = 100 - world_size
 
-    torch.cuda.synchronize()
-    shmem.barrier()
-    #print(f'[rank: {rank}], summed tensor: {routed_token_buffer.sum()}')
+    shmem.barrier() ## -> It seems like this is a requirement? Why is this the case, I am locally synchronizing.?
+    #print(f'[rank: {rank}], summed tensor: {routed_token_buffer.sum()}, num_ranks: {shmem.get_num_ranks()}')

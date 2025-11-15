@@ -18,4 +18,4 @@ def run(
         dist.all_to_all_single(tokens_recv, tokens)
 
         torch.cuda.synchronize()
-        #print(f'[rank: {rank}], summed token buffer: {sum([i.sum() for i in tokens_recv])}')
+        #print(f'[rank: {rank}], summed token buffer: {tokens_recv.sum()}')
