@@ -6,7 +6,7 @@ import triton.language as tl
 
 
 # ================================
-# 1. 标准 2D matmul kernel: Y = X @ W
+# 1. 2D matmul kernel: Y = X @ W
 # ================================
 
 @triton.jit
@@ -21,7 +21,7 @@ def matmul_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    标准单个 GEMM：X: [M, K], W: [K, N] -> Y: [M, N]
+    Single GEMM：X: [M, K], W: [K, N] -> Y: [M, N]
     """
 
     pid_m = tl.program_id(0)
@@ -31,7 +31,7 @@ def matmul_kernel(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    # 初始化累加器
+    # intilization of the accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_K):
@@ -58,7 +58,7 @@ def triton_gemm(X: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     """
     X: [M, K]
     W: [K, N]
-    返回 Y: [M, N]
+    back Y: [M, N]
     """
     M, K = X.shape
     K2, N = W.shape
@@ -89,13 +89,13 @@ def triton_gemm(X: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
 
 
 # ================================
-# 2. grouped matmul kernel: 多个 expert 一起算
+# 2. grouped matmul kernel: calculation of multi experts
 # ================================
 
 @triton.jit
 def grouped_matmul_kernel(
     X_ptr,            # [total_tokens, H]
-    W_flat_ptr,       # [num_experts * H, D] (把 W.view(...) 后的扁平矩阵)
+    W_flat_ptr,       # [num_experts * H, D] 
     Y_ptr,            # [total_tokens, D]
     total_tokens,     # = tokens_per_expert * num_experts
     hidden_dim,       # H
@@ -110,25 +110,29 @@ def grouped_matmul_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    对 num_experts 个 expert 做分组 GEMM：
+        
+    Perform Grouped GEMM over `num_experts` experts:
 
-      对于每个 expert e:
-          X_e: [tokens_per_expert, H]
-          W_e: [H, D]
-          Y_e: [tokens_per_expert, D]
+    For each expert `e`:
+        X_e: [tokens_per_expert, H]
+        W_e: [H, D]
+        Y_e: [tokens_per_expert, D]
 
-    X 在物理上是 [total_tokens, H]，按照 expert 块排布：
-        [X_0; X_1; ...; X_{E-1}]
-    W_flat 是 [num_experts * H, D]，把 [E, H, D] 拉平成 [E*H, D]。
-    Y 同 X，一样的分块。
+    Physical Layout:
+        - X: [total_tokens, H], arranged in expert blocks: [X_0; X_1; ...; X_{E-1}]
+        - W_flat: [num_experts * H, D], flattened from [E, H, D] to [E*H, D]
+        - Y: Follows the same block layout as X
+    
+
     """
 
-    expert_id = tl.program_id(0)       # 哪个 expert
-    pid_m = tl.program_id(1)           # 这个 expert 内部的第几个 M-block
+    expert_id = tl.program_id(0)       # which expert
+    pid_m = tl.program_id(1)           # which mblock of this expert
 
-    # 当前 expert 的 token 行号区间： [e * T, (e+1) * T)
+  # Token row indices for the current expert: [e * T, (e+1) * T)
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_idx = expert_id * tokens_per_expert + offs_m   # 全局行索引
+    row_idx = expert_id * tokens_per_expert + offs_m   # global line index
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
@@ -138,7 +142,7 @@ def grouped_matmul_kernel(
     for k in range(0, hidden_dim, BLOCK_K):
         k_offsets = k + offs_k
 
-        # --- 读 X ---
+        # --- read X ---
         x_ptrs = (
             X_ptr
             + row_idx[:, None] * stride_xm
@@ -147,8 +151,8 @@ def grouped_matmul_kernel(
         x_mask = (row_idx[:, None] < total_tokens) & (k_offsets[None, :] < hidden_dim)
         x = tl.load(x_ptrs, mask=x_mask, other=0.0)
 
-        # --- 读 W_flat ---
-        # 对应这一 expert 内的行号：
+        # --- read W_flat ---
+        # according to the line number inside the expert：
         #   row_in_W = expert_id * hidden_dim + k_offsets
         w_row = expert_id * hidden_dim + k_offsets
         w_ptrs = (
@@ -161,7 +165,7 @@ def grouped_matmul_kernel(
 
         acc += tl.dot(x, w)
 
-    # --- 写回 Y ---
+    # --- write back to Y ---
     y_ptrs = (
         Y_ptr
         + row_idx[:, None] * stride_ym
@@ -176,16 +180,22 @@ def grouped_triton_gemm(
     W: torch.Tensor,                     # [num_experts, H, D]
 ) -> torch.Tensor:
     """
-    一次性对所有 expert 做 Y = X_e @ W_e：
+        """
+    Perform Y = X_e @ W_e for all experts simultaneously:
 
-    routed_token_buffer: [E * T, H]，其中 E = num_experts, T = tokens_per_expert
-    W: [E, H, D]
-    返回 Y: [E * T, D]
+    Args/Inputs:
+        routed_token_buffer: [E * T, H], where E = num_experts, T = tokens_per_expert
+        W: [E, H, D]
+
+    Returns:
+        Y: [E * T, D]
+    """
+
     """
     total_tokens, hidden_dim = routed_token_buffer.shape
     num_experts, H2, expert_dim = W.shape
     assert H2 == hidden_dim, f"W.shape[1] ({H2}) must equal hidden_dim ({hidden_dim})"
-    assert total_tokens % num_experts == 0, "total_tokens 必须能整除 num_experts"
+    assert total_tokens % num_experts == 0, "total_tokens should must be able to divided by num_experts"
 
     tokens_per_expert = total_tokens // num_experts
 
