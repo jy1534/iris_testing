@@ -5,7 +5,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-import iris  # Triton 侧 kernel 里直接用 iris.* 原语
+import iris  
 ##Some imports has been deleted for they seems not to be utilized 
 
 # ================================
@@ -26,18 +26,18 @@ def alltoalldispatch_preamble(
     EP_SIZE: tl.constexpr,
 ):
     """
-    WIP: emulate torch.distributed.all_to_all_single 风格的“统计用”预处理，
-    用于 general_a2a（不等长 all-to-all）场景。
+    WIP: emulate torch.distributed.all_to_all_single pre-processing for stats，
+    for general_a2a
 
-    A:      没有真正用到，只是沿用原接口
-    B:      [world_size]，统计每个 device/rank 上 token 数
-    META:   [NUM_EXPERTS]，每个 expert 的路由计数
-    NUMS_flag: 标记所有 device 完成的计数
+    A:      not really utilized
+    B:      [world_size]，calculate each tokens of device/rank 
+    META:   [NUM_EXPERTS]，count of experts on each routing
+    NUMS_flag: label the finish of device
     """
     pid = tl.program_id(0)
     tl.device_assert(NUM_EXPERTS % EP_SIZE == 0)
 
-    # 每个 device_id 一次，累加 META 中属于该 device 的路由计数
+    # once for each device_id ,accumulate the routing count belongs to that device of the META 
     for device_id in tl.range(world_size):
         chunk_size: tl.constexpr = NUM_EXPERTS // EP_SIZE
         ptrs = tl.arange(0, chunk_size) + chunk_size * device_id
@@ -64,7 +64,7 @@ def alltoalldispatch_preamble(
             scope="sys",
         )
 
-    # 简单 spin 等待所有 device 完成
+    #  ez spin wait for the completion of all
     world_size_i32 = tl.full([], world_size, dtype=tl.int32)
     while tl.load(NUMS_flag) != world_size_i32:
         pass
@@ -90,31 +90,34 @@ def alltoalldispatch_main(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    主 all-to-all kernel：
-      - 从本 rank 的 input_dev_tokens 中，按块拷贝到 routed_token_buffer 中对应位置。
-      - world_size × transmit_size grid:
-          program_id(0) = device_id   (目标 device/rank)
-          program_id(1) = pid         (第几个“消息块”)
+    Main all-to-all kernel:
+      - Performs a block-wise copy from the current rank's `input_dev_tokens` to the corresponding position in `routed_token_buffer`.
+      - Grid configuration (world_size x transmit_size):
+          program_id(0) = device_id   (Target device/rank)
+          program_id(1) = pid         (Message block index)
     """
 
-    pid = tl.program_id(1)        # 第几个 token block
-    device_id = tl.program_id(0)  # 目标 device (rank)
 
-    # non_local_ptrs: 当前 rank 在 routed_token_buffer 中的起始位置
+    pid = tl.program_id(1)        # which token block
+    device_id = tl.program_id(0)  # target device (rank)
+
+    # non_local_ptrs: routed_token_buffer the initial position of currnt rank
     non_local_ptrs = (
         cur_rank * transmit_size * stride_am
         + pid * stride_am
         + tl.arange(0, BLOCK_SIZE)[None, :] * stride_ak
     )
 
-    # ptrs: 本 rank input_dev_tokens 中对应 block 的位置
+    # ptrs:Position of the corresponding block in the current rank's input_dev_tokens."
+
     ptrs = (
         pid * stride_am
         + device_id * transmit_size * stride_am
         + tl.arange(0, BLOCK_SIZE)[None, :] * stride_ak
     )
 
-    # 沿 hidden_dim 方向分块拷贝
+    # Block-wise copy along hidden_dim
+
     for iter in tl.range(tl.cdiv(hidden_dim, BLOCK_SIZE)):
         iris.put(
             input_dev_tokens + ptrs,
@@ -128,7 +131,8 @@ def alltoalldispatch_main(
         non_local_ptrs += BLOCK_SIZE * stride_ak
         ptrs += BLOCK_SIZE * stride_ak
 
-    # 本地计数：对 LOCAL_flag[device_id] 做一个 atomic_add
+    # Local count: Perform atomic_add on LOCAL_flag[device_id]
+
     tl.atomic_add(
         LOCAL_flag + device_id,
         1,
@@ -136,11 +140,13 @@ def alltoalldispatch_main(
     )
 
     if pid == 0:
-        # 等待该 device_id 的所有 blocks 完成（共 transmit_size 次）
+      # Wait for all blocks for this device_id to complete (total: transmit_size)
+
         while tl.load(LOCAL_flag + device_id) != transmit_size:
             pass
 
-        # 全部完成后，用 Iris 的跨 rank atomic 通知对方
+    # Upon completion, notify the target rank using Iris cross-rank atomic
+
         iris.atomic_add(
             DATA_flag,
             1,
@@ -189,7 +195,7 @@ def triton_gemm(X, W):
 
 
 # ================================
-# Python 入口：run()
+# Python entrance：run()
 # ================================
 
 def run(
@@ -204,19 +210,20 @@ def run(
     shmem,
     general_a2a: bool,
 ):
-    """
-    Shmem all-to-all + Phase1 FFN GEMM（当前是 grouped GEMM 版本）。
+   """
+    Shmem all-to-all + Phase1 FFN GEMM (currently grouped GEMM version).
 
     Args:
-        rank:         本进程 rank
-        tokens:       [num_tokens, hidden_dim] 本 rank 输入 token
-        transmit_size: 每个 rank -> 其他 rank 的 token 数（均匀 case）
-        batch, seq, hidden_dim: 形状元信息（目前主要用于 sanity check）
-        num_experts:  expert 个数
-        world_size:   总 rank 数
-        shmem:        ShmemCompat 实例（基于 Iris）
-        general_a2a:  是否走不均匀 all-to-all path（目前未实现）
-    """
+        rank:         Current process rank.
+        tokens:       [num_tokens, hidden_dim] Input tokens for the current rank.
+        transmit_size: Number of tokens sent from each rank to every other rank (uniform case).
+        batch, seq, hidden_dim: Shape metadata (currently used mainly for sanity checks).
+        num_experts:  Total number of experts.
+        world_size:   Total number of ranks (world size).
+        shmem:        ShmemCompat instance (based on Iris).
+        general_a2a:  Whether to use the non-uniform all-to-all path (currently not implemented).
+"""
+
 
     device_id = rank % max(torch.cuda.device_count(), 1)
 
