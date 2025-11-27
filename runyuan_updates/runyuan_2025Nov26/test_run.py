@@ -10,8 +10,8 @@ from alltoall_persistent_gemm import run
 def main():
 
     # -----------------------------
-    # Fix: 初始化 fake distributed
-    # 不需要环境变量
+    # Fix:intilization of fake distributed
+    # no env variable
     # -----------------------------
     if not dist.is_initialized():
         dist.init_process_group(
@@ -32,7 +32,7 @@ def main():
     tokens = torch.randn(batch * seq, hidden_dim, dtype=torch.bfloat16, device=device)
     transmit_size = tokens.shape[0]
 
-    # 使用适配的 Shmem
+    # Shmem
     shmem = ShmemCompat()
 
     out = run(
