@@ -18,6 +18,6 @@ class ShmemCompat:
     def get_heap_bases(self):
         return self.ctx.get_heap_bases()
 
-    # 其他方法自动透传
+
     def __getattr__(self, name):
         return getattr(self.ctx, name)
