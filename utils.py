@@ -63,3 +63,26 @@ def gen_tensor(
     expert_per_device = num_experts // world_size
 
     return coalesced_experts, global_max.item()*expert_per_device 
+
+###new func
+def gen_expert_weights(
+    num_experts: int,
+    hidden_dim: int,
+    expert_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+
+##    Python-side expert weight generation.
+##    Shape convention:
+##    expert_weights: [num_experts, hidden_dim, expert_dim]
+
+    torch.manual_seed(0)
+    weights = torch.randn(
+        num_experts,
+        hidden_dim,
+        expert_dim,
+        device=device,
+        dtype=dtype,
+    )
+    return weights

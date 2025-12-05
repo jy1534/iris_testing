@@ -13,6 +13,8 @@ import os
 
 import iris
 
+import time #4 timing
+
 ## Experimental preamble to enable a more general and unbalanced a2a. Currently a WIP. ##
 @triton.jit
 def alltoalldispatch_preamble(
@@ -167,56 +169,164 @@ def alltoalldispatch_main(
             scope="sys" 
         )
 
-def run(
-    rank: int, tokens: torch.tensor, transmit_size: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
-    world_size: int, shmem, general_a2a: bool 
-):
+def grouped_triton_gemm(
+    routed_token_buffer: torch.Tensor,
+    expert_weights: torch.Tensor,
+) -> torch.Tensor:
     """
-    This is the callee function for the Shmem-based all-to-all + gemm kernels.
+    Minimal grouped GEMM baseline in pure PyTorch.
 
-    Tokens: [cnt, hidden dimension]-sized tensor representing the input tokens to this layer.
-    transmit_size: num_experts sized tensor representing the number of tokens routed to expert_i.
-    general_a2a: Flag to trigger unbalanced a2a capability, currently not working.
+    routed_token_buffer: [N_tokens, hidden_dim]
+    expert_weights:      [num_experts, hidden_dim, expert_dim]
+
+    For now we assume that tokens for each expert are laid out in contiguous
+    chunks along dim=0, each chunk having the same length.
     """
+    assert routed_token_buffer.dim() == 2
+    assert expert_weights.dim() == 3
+
+    num_experts, hidden_dim_w, expert_dim = expert_weights.shape
+    total_tokens, hidden_dim_x = routed_token_buffer.shape
+    assert hidden_dim_x == hidden_dim_w, "Hidden dim mismatch between tokens and expert weights"
+
+    assert total_tokens % num_experts == 0, "Total tokens must be divisible by num_experts"
+    tokens_per_expert = total_tokens // num_experts
+
+    outputs = []
+    offset = 0
+    for i in range(num_experts):
+        x_i = routed_token_buffer[offset: offset + tokens_per_expert]   # [n_i, hidden_dim]
+        w_i = expert_weights[i]                                         # [hidden_dim, expert_dim]
+        y_i = x_i @ w_i                                                 # [n_i, expert_dim]
+        outputs.append(y_i)
+        offset += tokens_per_expert
+
+    return torch.cat(outputs, dim=0)     # [N_tokens, expert_dim]
+
+
+#def run(
+#    rank: int, tokens: torch.tensor, transmit_size: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
+#    world_size: int, shmem, general_a2a: bool 
+#):
+#    """
+#    This is the callee function for the Shmem-based all-to-all + gemm kernels.
+
+#    Tokens: [cnt, hidden dimension]-sized tensor representing the input tokens to this layer.
+#    transmit_size: num_experts sized tensor representing the number of tokens routed to expert_i.
+#    general_a2a: Flag to trigger unbalanced a2a capability, currently not working.
+#    """
+def run(
+    rank: int,
+    tokens: torch.Tensor,
+    expert_weights: torch.Tensor,
+    transmit_size: int,
+    batch: int,
+    seq: int,
+    hidden_dim: int,
+    num_experts: int,
+    world_size: int,
+    shmem,
+    general_a2a: bool,
+    # timing profile switch
+    profile: bool = False
+):
     device_id = rank % torch.cuda.device_count()
 
     if general_a2a:
         ## Instantiate shmem based heap regions over here. ##
-        NUMS_flag = shmem.zeros(1, dtype=torch.int32, device="cuda")
-        device_cnts = shmem.zeros(world_size, device="cuda")
+        #NUMS_flag = shmem.zeros(1, dtype=torch.int32, device="cuda")
+        #device_cnts = shmem.zeros(world_size, device="cuda")
 
         ## First, we have to call an alltoall that will aggregrate token level information
         ##   to instantiate buffer sizes.
-        alltoalldispatch_preamble[(1,1,1)](
-            tokens, device_cnts, meta, NUMS_flag, shmem.get_heap_bases(), 
-            dist.get_rank(), world_size, num_experts, tokens.shape[0], world_size
-        ) 
+        #alltoalldispatch_preamble[(1,1,1)](
+        #    tokens, device_cnts, meta, NUMS_flag, shmem.get_heap_bases(), 
+        #    dist.get_rank(), world_size, num_experts, tokens.shape[0], world_size
+        #) 
 
         ## Next, we instantiate token buffers accordingly for the next phase of the all-to-all + gemm. ##
-        routed_token_buffer = shmem.zeros(int(round(device_cnts.sum().item())), tokens.shape[-1])
+        #routed_token_buffer = shmem.zeros(int(round(device_cnts.sum().item())), tokens.shape[-1])
+        raise NotImplementedError("general_a2a path not implemented yet.")  
     else:
+        # Fixed-size balanced all-to-all path.
+
+        # Ensure tokens are on the correct device.
+        tokens = tokens.to(f"cuda:{device_id}")
+        
+        # Shmem-based receive buffer.
         ## For now, we fix a fix sized buffer to transmit over, otherwise things get far too complicated.
         assert tokens.shape[0] % world_size == 0, 'Tensor sizes not properly shaped.'
         routed_token_buffer = shmem.zeros(transmit_size * world_size, tokens.shape[-1], dtype=tokens.dtype, device="cuda")
-        assert routed_token_buffer.shape[-1] == tokens.shape[-1], 'incorrect tensor sizes for source/dest buffers.'
+        #assert routed_token_buffer.shape[-1] == tokens.shape[-1], 'incorrect tensor sizes for source/dest buffers.'
+        
+        # Flags for synchronization between ranks. 
         DATA_flag = shmem.zeros(world_size, device="cuda")
         LOCAL_flag = torch.zeros(world_size, dtype=torch.int32).to(tokens.device)
-        outgoing_buffer_size = transmit_size * world_size
+        #outgoing_buffer_size = transmit_size * world_size
 
-    s1 = torch.cuda.Stream()
-    s2 = torch.cuda.Stream()
+        # 2streams A2A/GEMM    
+        s1 = torch.cuda.Stream()
+        s2 = torch.cuda.Stream()
+
+        # A2A(Trition + SHMEM) Timing START
+        if profile:
+            torch.cuda.synchronize()
+            t0 = time.time()
     ## Now, we launch the main all-to-all kernel + persistent gemm. ##
-    with torch.cuda.stream(s1):
-        alltoalldispatch_main[(world_size,transmit_size,1)](
-            routed_token_buffer, tokens, DATA_flag, LOCAL_flag,
-            tokens.stride(0), tokens.stride(1), shmem.get_heap_bases(), 
-            tokens.shape[0], transmit_size * world_size, 
-            tokens.shape[-1], transmit_size, rank, 
-            world_size, num_experts, world_size, BLOCK_SIZE=256  ## Temporarily put 256 but autotune out in the future.
-        )
-    with torch.cuda.stream(s2):
+        with torch.cuda.stream(s1):
+            alltoalldispatch_main[(world_size,transmit_size,1)](
+                routed_token_buffer, tokens, DATA_flag, LOCAL_flag,
+                tokens.stride(0), tokens.stride(1), shmem.get_heap_bases(), 
+                tokens.shape[0], transmit_size * world_size, 
+                tokens.shape[-1], transmit_size, rank, 
+                world_size, num_experts, world_size, BLOCK_SIZE=256  ## Temporarily put 256 but autotune out in the future.
+            )
+
+
+        # After the end of kernel, do barrier again, ensure A2a completion
+        torch.cuda.synchronize()
+        shmem.barrier()  # 重新启用：其开销算在 A2A 内
+
+        if profile:
+            a2a_time = time.time() - t0
+        # End of A2A timing
+
+        if rank == 0:
+            print("[custom] routed_token_buffer sum =", routed_token_buffer.sum().item())
+        
+        # Grouped GEMM timing start
+        if profile:
+            torch.cuda.synchronize()
+            t1 = time.time()
+        
+        
+        
+        #with torch.cuda.stream(s2):
         ## Call the persistent Gemm here that does the MLP compute. ##
         NUM_REM_SMS = 100 - world_size
 
-    shmem.barrier() ## -> It seems like this is a requirement? Why is this the case, I am locally synchronizing.?
-    #print(f'[rank: {rank}], summed tensor: {routed_token_buffer.sum()}, num_ranks: {shmem.get_num_ranks()}')
+    #   shmem.barrier() ## -> It seems like this is a requirement? Why is this the case, I am locally synchronizing.?
+        #print(f'[rank: {rank}], summed tensor: {routed_token_buffer.sum()}, num_ranks: {shmem.get_num_ranks()}')
+
+            ## Call the grouped GEMM here that does the expert MLP compute. ##
+        with torch.cuda.stream(s2):           
+            #NUM_REM_SMS = 100 - world_size
+            moe_output = grouped_triton_gemm(
+                routed_token_buffer,
+                expert_weights,
+            )
+        # Ensure both streams have finished before returning.
+        torch.cuda.synchronize()
+        if profile:
+            gemm_time = time.time() - t1
+        # End of Group gemm timing
+        # Ensure both streams have finished before returning.
+        torch.cuda.synchronize()
+
+        if profile:
+            return moe_output, {
+                "a2a_time": a2a_time,
+                "gemm_time": gemm_time,
+            }
+
+        return moe_output
