@@ -43,7 +43,7 @@ class ShmemStep12Buffers:
 
 
 def init_step12_buffers(
-    *,
+    #*,
     shmem,
     world_size: int,
     e_local: int,
@@ -89,7 +89,7 @@ def iris_counts_exchange_kernel(
     pca_ptr,  # [E, world] int32 (symmetric on dst)
     counts_ready_ptr,  # [1] int32 (symmetric on dst)
     heap_bases,
-    *,
+    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -145,7 +145,7 @@ def iris_tokens_exchange_kernel(
     token_buf_ptr,
     token_sync_ptr,
     heap_bases,
-    *,
+    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -241,7 +241,7 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
 
 
 def run_step12(
-    *,
+    #*,
     rank: int,
     world_size: int,
     send_payload: torch.Tensor,  # [sum_send, H]
@@ -370,5 +370,3 @@ def run_step12(
                 num_warps=8,
             )
     return buffers
-
-
