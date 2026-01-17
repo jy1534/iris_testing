@@ -1,65 +1,147 @@
+import math
+import random
+from typing import Tuple, List
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-import math
 
-def gen_tensor(
-    batch: int, seq: int, hidden_dim: int, 
-    world_size: int, num_experts: int, 
-    rank: int, topk: int) -> tuple[torch.tensor, torch.tensor]:
 
-    torch.manual_seed(rank)
-    assert num_experts % world_size == 0, "Incorrect EP_SIZE, world_size should evenly divide num_experts."
+def set_seed(base_seed: int, rank: int) -> None:
+    #Use different seeds per-rank for token generation / routing decisions.
+  
+    seed = int(base_seed) + int(rank)
+    random.seed(seed)
+    try:
+        import numpy as np  # type: ignore
 
-    tokens = torch.rand(batch*seq, hidden_dim, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
-    #router = torch.randn(hidden_dim, num_experts, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
-    
-    ## Initialization option: 1 -> not super good. ##
-    #router = torch.randn(hidden_dim, num_experts, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu") * 0.1
-    #router = router + torch.log(torch.tensor(1.0 / num_experts))
+        np.random.seed(seed)
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-    ## Initialization option: 2 -> not super good. ##
-    #std = 0.01 / math.sqrt(hidden_dim)
-    #router = torch.randn(hidden_dim, num_experts, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu") * std
-    #uniform_bias = math.log(1.0 / num_experts)
-    #router = router + uniform_bias
 
-    ## Initialization option: 3 -> seems to work the best, but still not ideal. ##
-    router = torch.zeros(hidden_dim, num_experts, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
-    # Add small random perturbation
+def gen_local_tokens(
+    batch: int,
+    seq: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    base_seed: int,
+    rank: int,
+) -> torch.Tensor:
+    #Generate local tokens [batch*seq, hidden_dim] deterministically per rank
+    set_seed(base_seed, rank)
+    return torch.rand(batch * seq, hidden_dim, dtype=dtype, device=device)
+
+
+def gen_router(
+    hidden_dim: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    base_seed: int,
+) -> torch.Tensor:
+    #Generate a (shared-across-ranks) router matrix [H, num_experts].
+    # same router across ranks; only tokens differ per rank.
+    random.seed(int(base_seed) + 777)
+    torch.manual_seed(int(base_seed) + 777)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(int(base_seed) + 777)
+        torch.cuda.manual_seed_all(int(base_seed) + 777)
+
+    router = torch.zeros(hidden_dim, num_experts, dtype=dtype, device=device)
     router = router + torch.randn_like(router) * 0.001
+    return router
 
-    routed_values = F.softmax(torch.einsum('bh, he -> be', tokens, router), dim=-1)
-    top_vals, top_idxs = torch.topk(routed_values, topk)
 
-    ## This is very incorrect when it comes to chunking. ## --> Something is going wrong here.
-    expert_tokens = []
-    for ex in range(num_experts):
-        mask = (top_idxs == ex).any(dim=-1)
-        tkns = tokens[mask] # (num tokens routed to an expert, hidden dimension).
-        if tkns.numel() > 0:
-            expert_tokens.append(tkns)
-        else:
-            tmp_tkns = torch.zeros(1, hidden_dim, dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
-            expert_tokens.append(tmp_tkns)
+def route_and_pack_padding_free(
+    tokens: torch.Tensor,
+    router: torch.Tensor,
+    topk: int,
+    world_size: int,
+    num_experts_total: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Padding-free routing -> (send_payload, send_counts, send_dst_offsets, send_dst_sizes).
 
-    ## Next, we pad to the largest element-sized tensor.
-    max_tkn_cnt = max([i.shape[0] for i in expert_tokens])
+    Layout of send_payload is DEST-major then EXPERT-local-major:
+      [dst0][e0 tokens][e1 tokens]...[eE-1 tokens] [dst1] ...
 
-    ## We exchange this between devices. ##
-    global_max = torch.tensor([max_tkn_cnt], dtype=torch.int32).to("cuda" if torch.cuda.is_available() else "cpu")
-    dist.all_reduce(global_max, dist.ReduceOp.MAX)
-    if rank == 0:
-        ## Why is the % incorrect? ##
-        print(f'[rank: {rank}]: global_max_tkn_cnt: {global_max.item()}, % total tokens: {(global_max.item() / (batch * seq * world_size * topk))*100:.2f}%')
+    send_counts: int32 [world, E_local]
+    send_dst_offsets: int32 [world] (row offsets into send_payload)
+    send_dst_sizes: int32 [world] (rows per dst)
 
-    expert_tokens = [torch.cat(
-        (i, torch.zeros(global_max.item() - i.shape[0], hidden_dim, dtype=tokens.dtype).to(tokens.device))
-    ) for i in expert_tokens]
+    """
+    assert tokens.is_cuda, "Expect CUDA tokens"
+    device = tokens.device
+    dtype = tokens.dtype
 
-    ## Lastly, we have to coalesce for the all-to-all. ##
-    coalesced_experts = torch.cat(expert_tokens, dim=0)
+    assert num_experts_total % world_size == 0, "num_experts_total must be divisible by world_size"
+    e_local = num_experts_total // world_size
 
-    expert_per_device = num_experts // world_size
+    # logits: [T, E]
+    routed_values = F.softmax(torch.einsum('th,he->te', tokens, router), dim=-1)
+    _, top_idxs = torch.topk(routed_values, topk, dim=-1)  # [T, topk]
 
-    return coalesced_experts, global_max.item()*expert_per_device 
+    # Build per-(dst, expert_local) buckets (Python lists for determinism)
+    # bucket[dst][e_local] is a Python list of 1D tensors [H]
+    buckets: List[List[List[torch.Tensor]]] = [
+        [[] for _ in range(e_local)] for _ in range(world_size)
+    ]
+
+    # Stable append order: increasing token index, then increasing top-k slot
+    
+    t = tokens
+    for ti in range(t.shape[0]):
+        tok = t[ti]
+        for kk in range(topk):
+            ex = int(top_idxs[ti, kk].item())
+            dst = ex // e_local
+            el = ex - dst * e_local
+            buckets[dst][el].append(tok)
+
+    # Build counts and payload
+    send_counts = torch.zeros((world_size, e_local), dtype=torch.int32, device=device)
+    payload_chunks: List[torch.Tensor] = []
+    dst_offsets = torch.zeros((world_size,), dtype=torch.int32, device=device)
+    dst_sizes = torch.zeros((world_size,), dtype=torch.int32, device=device)
+
+    running = 0
+    for dst in range(world_size):
+        dst_offsets[dst] = running
+        dst_rows = 0
+        for el in range(e_local):
+            n = len(buckets[dst][el])
+            send_counts[dst, el] = n
+            if n > 0:
+                payload_chunks.append(torch.stack(buckets[dst][el], dim=0))
+            dst_rows += n
+        dst_sizes[dst] = dst_rows
+        running += dst_rows
+
+    if running == 0:
+        # Degenerate: no tokens routed (possible if batch*seq==0). Create empty payload
+        send_payload = torch.empty((0, tokens.shape[1]), dtype=dtype, device=device)
+    else:
+        send_payload = torch.cat(payload_chunks, dim=0)
+
+    return send_payload, send_counts, dst_offsets, dst_sizes
+
+
+def gen_local_weights(
+    e_local: int,
+    hidden_dim: int,
+    out_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    base_seed: int,
+    rank: int,
+) -> torch.Tensor:
+    # Make weights rank-dependent but deterministic.
+    set_seed(base_seed + 12345, rank)
+    w = torch.empty((e_local, hidden_dim, out_dim), dtype=dtype, device=device)
+    torch.nn.init.normal_(w, mean=0.0, std=0.02)
+    return w
