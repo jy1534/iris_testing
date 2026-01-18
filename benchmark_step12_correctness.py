@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 import iris
 
-from a2a_shmem_step12_kernels import run_step12, init_step12_buffers
+from a2a_shmem_step12_kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
 from baseline import run_step12_baseline_ref, init_step12_baseline_buffers
 
 
@@ -130,14 +130,14 @@ def check_step12(
 
     # init shmem buffers
     shmem = _init_iris_shmem()
-    buffers = init_step12_buffers(
-        shmem=shmem,
-        world_size=world_size,
-        e_local=e_local,
-        capacity=capacity,
-        hidden_dim=hidden_dim,
-        token_dtype=torch.bfloat16,
-    )
+    buffers = alloc_shmem_buffers(
+    shmem=shmem,
+    world_size=world_size,
+    e_local=e_local,
+    capacity=capacity,
+    hidden_dim=hidden_dim,
+    token_dtype=torch.bfloat16,
+)
 
     # clear token_buf for repeated runs (slow but removes any ambiguity)
     if os.getenv("CLEAR_TOKEN_BUF", "0") == "1":
@@ -147,8 +147,9 @@ def check_step12(
 
     dst_offsets = _build_dst_offsets(send_counts)
 
+    comm_stream = torch.cuda.Stream(device=device)
     # run custom step1/2
-    run_step12(
+    run_counts_and_tokens_exchange(
         rank=rank,
         world_size=world_size,
         send_payload=send_payload,
@@ -158,9 +159,11 @@ def check_step12(
         e_local=e_local,
         capacity=capacity,
         hidden_dim=hidden_dim,
-        stream_comm=None,
-    )
+        #stream_comm=None,
+        stream_comm = comm_stream
 
+    )
+    comm_stream.synchronize()  
     # Ensure all ranks have launched/completed their kernels before we start waiting locally.
     dist.barrier()
 

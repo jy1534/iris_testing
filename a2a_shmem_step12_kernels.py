@@ -29,7 +29,7 @@ def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
 
 
 @dataclass
-class ShmemStep12Buffers:
+class ShmemBuffers:
     # Step-1 outputs / sync
     pca: torch.Tensor  # [E, world] int32 (symmetric)
     counts_ready: torch.Tensor  # [1] int32 (symmetric)
@@ -42,7 +42,7 @@ class ShmemStep12Buffers:
     heap_bases: torch.Tensor
 
 
-def init_step12_buffers(
+def alloc_shmem_buffers(
     #*,
     shmem,
     world_size: int,
@@ -50,7 +50,7 @@ def init_step12_buffers(
     capacity: int,
     hidden_dim: int,
     token_dtype: torch.dtype,
-) -> ShmemStep12Buffers:
+) -> ShmemBuffers:
     """
     Allocate symmetric buffers with fixed shapes.
     """
@@ -69,7 +69,7 @@ def init_step12_buffers(
 
     heap_bases = shmem.get_heap_bases()
 
-    return ShmemStep12Buffers(
+    return ShmemBuffers(
         pca=pca,
         counts_ready=counts_ready,
         token_buf=token_buf,
@@ -163,6 +163,16 @@ def iris_tokens_exchange_kernel(
         while tl.load(counts_ready_ptr, volatile=True).to(tl.int32) < EXPECTED:
             pass
 
+        # Acquire fence (local): pair with remote release increments on dst counts_ready.
+        iris.atomic_add(
+            counts_ready_ptr,
+            0,
+            src_rank,
+            src_rank,
+            heap_bases,
+            sem="acquire",
+            scope="gpu",
+        )
     # How many rows to send for this (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
@@ -240,14 +250,14 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     return offs.contiguous()
 
 
-def run_step12(
+def run_counts_and_tokens_exchange(
     #*,
     rank: int,
     world_size: int,
     send_payload: torch.Tensor,  # [sum_send, H]
     send_counts: torch.Tensor,  # [world, E] int32
     dst_offsets: torch.Tensor,  # [world] int32
-    buffers: ShmemStep12Buffers,
+    buffers: ShmemBuffers,
     e_local: int,
     capacity: int,
     hidden_dim: int,
@@ -257,10 +267,9 @@ def run_step12(
     #  - clear_local_counters=False: use a monotonic epoch and wait for (iter_idx+1)*world_size
     clear_local_counters: bool = True,
     iter_idx: int = 0,
-) -> ShmemStep12Buffers:
+) -> ShmemBuffers:
     """
     Execute Step-1 and Step-2 kernels on the provided comm stream.
-
     """
 
     _assert_cuda_int32(send_counts, "send_counts")
@@ -284,18 +293,19 @@ def run_step12(
     # Decide the expected value for the receiver-side counters.
     expected = world_size if clear_local_counters else (iter_idx + 1) * world_size
 
-    # Reset receiver-side counters if using the simple per-iter reset mode.
-    if clear_local_counters:
-        if stream_comm is None:
+    # CHANGED: Defensive coding: require comm stream, remove predication / duplicated branches.
+    if stream_comm is None:
+        raise ValueError(
+            "stream_comm must be provided. We always run comm kernels on a dedicated comm stream."
+        )
+
+    # CHANGED: Single stream region, no duplicated code.
+    with torch.cuda.stream(stream_comm):
+        # Reset receiver-side counters if using the simple per-iter reset mode.
+        if clear_local_counters:
             buffers.counts_ready.zero_()
             buffers.token_sync.zero_()
-        else:
-            with torch.cuda.stream(stream_comm):
-                buffers.counts_ready.zero_()
-                buffers.token_sync.zero_()
 
-    # Launch on comm stream.
-    if stream_comm is None:
         # Step-1: counts
         iris_counts_exchange_kernel[(world_size,)](
             send_counts,
@@ -308,8 +318,6 @@ def run_step12(
             BLOCK_E=128,
             num_warps=4,
         )
-
-        
 
         # Step-2: tokens
         iris_tokens_exchange_kernel[(world_size, e_local)](
@@ -326,47 +334,10 @@ def run_step12(
             e_local=e_local,
             CAP=capacity,
             hidden_dim=hidden_dim,
-            EXPECTED=expected,     
+            EXPECTED=expected,
             BLOCK_M=32,
             BLOCK_K=128,
             num_warps=8,
         )
 
-    else:
-        with torch.cuda.stream(stream_comm):
-            # Step-1: counts
-            iris_counts_exchange_kernel[(world_size,)](
-                send_counts,
-                buffers.pca,
-                buffers.counts_ready,
-                buffers.heap_bases,
-                src_rank=rank,
-                world_size=world_size,
-                e_local=e_local,
-                BLOCK_E=128,
-                num_warps=4,
-            )
-
-    
-
-            # Step-2: tokens
-            iris_tokens_exchange_kernel[(world_size, e_local)](
-                buffers.counts_ready,
-                send_payload,
-                send_counts,
-                dst_offsets,
-                expert_offs,
-                buffers.token_buf,
-                buffers.token_sync,
-                buffers.heap_bases,
-                src_rank=rank,
-                world_size=world_size,
-                e_local=e_local,
-                CAP=capacity,
-                hidden_dim=hidden_dim,
-                EXPECTED=expected,     
-                BLOCK_M=32,
-                BLOCK_K=128,
-                num_warps=8,
-            )
     return buffers
