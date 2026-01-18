@@ -77,7 +77,12 @@ def alloc_shmem_buffers(
         heap_bases=heap_bases,
     )
 
+
+
 # Step-1 kernel: counts exchange
+
+
+
 @triton.jit
 def iris_counts_exchange_kernel(
     send_counts_ptr,  # [world, E] int32 (local)
@@ -124,7 +129,12 @@ def iris_counts_exchange_kernel(
         scope="sys",
     )
 
+
+
+
 # Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
+
+
 @triton.jit
 def iris_tokens_exchange_kernel(
     counts_ready_ptr,      # [1] int32 local
@@ -210,45 +220,22 @@ def iris_tokens_exchange_kernel(
         scope="sys",
     )
 
-## TODO(ahanugupta): investigate if we should remove mxa as tl.constexpr. 
-## This will change between iterations and trigger recompilation.
-@triton.jit
-def token_shuffle(
-    pca_cumsum_ptr, pca_ptr, ## Both of size: [E, world_size]
-    token_buffer_ptr, # Size: [E, world_size, mxa, hidden_dim]
-    output_buffer_ptr, # Size: [S, hidden_dim]
-    E: tl.constexpr, world_size: tl.constexpr,
-    mxa: tl.constexpr, hidden_dim: tl.constexpr
-    BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
-):
-    expert = tl.program_id(0)
-    dev_id = tl.program_id(1)
-    token_id = tl.program_id(2)
+#  Kernel-3/4
 
-    ## We predicate some blocks off immediately. ##
-    num_tokens = tl.load(pca_ptr + (expert * world_size + dev_id).to(tl.int64))
 
-    if num_tokens < token_id:
-        return ## Immediately terminate.
 
-    ## Else, we have a non-zero token to shift to the output buffer. ##
-    
-    ## We loop over the hidden dimension and shift a token over to the output buffer. 
-    inp_ptrs = expert * world_size * mxa * hidden_dim + dev_id *  mxa * hidden_dim + token_id * hidden_dim + tl.arange(BLOCK_X)
-    cum_summed_prev = tl.load(pca_cumsum_ptr + (expert * world_size + dev_id).to(tl.int64))
-    packed_ptrs = (cum_summed_prev + token_id) * hidden_dim
-    for _ in tl.range(tl.cdiv(hidden_dim, BLOCK_X)):
+def step3_data_shuffle_triton(*args, **kwargs):
+    raise NotImplementedError("Step 3 (data shuffling / compaction) is not implemented in this file.")
 
-        tkns = tl.load(token_buffer_ptr + inp_ptrs, mask=0)
-        tl.store(output_buffer_ptr + packed_ptrs, tkns)
-
-        packed_ptrs += BLOCK_X
-        inp_ptrs += BLOCK_X
 
 def step4_grouped_gemm_triton(*args, **kwargs):
     raise NotImplementedError("Step 4 (grouped GEMM with per-expert spin-wait) is not implemented in this file.")
 
+
+
 # Step-1/2 run wrapper
+
+
 def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     """
     Prefix offsets within each destination block in send_payload.
@@ -319,9 +306,7 @@ def run_counts_and_tokens_exchange(
             buffers.counts_ready.zero_()
             buffers.token_sync.zero_()
 
-    assert stream_comm, 'Incorrectly initialized stream_comm'
-    with torch.cuda.stream(stream_comm):
-        # Step-1: exchange token counts.
+        # Step-1: counts
         iris_counts_exchange_kernel[(world_size,)](
             send_counts,
             buffers.pca,
@@ -334,7 +319,7 @@ def run_counts_and_tokens_exchange(
             num_warps=4,
         )
 
-        # Step-2: exchange tokens.
+        # Step-2: tokens
         iris_tokens_exchange_kernel[(world_size, e_local)](
             buffers.counts_ready,
             send_payload,
@@ -354,23 +339,5 @@ def run_counts_and_tokens_exchange(
             BLOCK_K=128,
             num_warps=8,
         )
-
-    ## First, we aggregrate token counts and create a packed output buffer.
-    cum_summed_tkn_cnt = torch.roll(buffers.pca.view(-1).cumsum(), shifts=1)
-    total_tkn_cnt = cum_summed_tkn_cnt[-1]
-    output_buffer = torch.zeros((total_tkn_cnt, hidden_dim), dtype=send_payload.dtype).to(send_payload.device)
-    cum_summed_tkn_cnt[0] = 0
-    cum_summed_tkn_cnt = cum_summed_tkn_cnt.view(e_local, -1)
-    ## Next, launch token shuffling kernel. ##
-    grid = (e_local, world_size, buffers.token_buf.size(2))
-
-    token_shuffle[grid](
-        cum_summed_tkn_cnt, buffers.pca,
-        buffers.token_buf, 
-        output_buffer,
-        e_local, world_size,
-        buffers.token_buf.size(2), hidden_dim,
-        128
-    )
 
     return buffers
