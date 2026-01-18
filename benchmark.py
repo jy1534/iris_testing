@@ -32,8 +32,6 @@ from alltoall_persistent_gemm import (
 
 
 # Small utilities
-
-
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name, None)
     return int(v) if v is not None else int(default)
@@ -45,7 +43,6 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _init_iris_shmem_compat():
-   
   
 
     sm = getattr(iris, "symmetric_memory", None)
