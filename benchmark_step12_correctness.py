@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 import iris
 
-from kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
+from a2a_shmem_step12_kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
 from baseline import run_step12_baseline_ref, init_step12_baseline_buffers
 
 
