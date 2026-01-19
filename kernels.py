@@ -27,7 +27,6 @@ def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
     assert x.is_cuda, f"{name} must be CUDA"
     assert x.dtype == torch.int32, f"{name} must be int32"
 
-
 @dataclass
 class ShmemBuffers:
     # Step-1 outputs / sync
@@ -77,12 +76,7 @@ def alloc_shmem_buffers(
         heap_bases=heap_bases,
     )
 
-
-
 # Step-1 kernel: counts exchange
-
-
-
 @triton.jit
 def iris_counts_exchange_kernel(
     send_counts_ptr,  # [world, E] int32 (local)
@@ -129,12 +123,7 @@ def iris_counts_exchange_kernel(
         scope="sys",
     )
 
-
-
-
 # Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
-
-
 @triton.jit
 def iris_tokens_exchange_kernel(
     counts_ready_ptr,      # [1] int32 local
@@ -220,22 +209,124 @@ def iris_tokens_exchange_kernel(
         scope="sys",
     )
 
-#  Kernel-3/4
+## TODO(ahanugupta): investigate if we should remove mxa as tl.constexpr. 
+## This will change between iterations and trigger recompilation.
+@triton.jit
+def token_shuffle(
+    pca_cumsum_ptr, pca_ptr, ## Both of size: [E, world_size]
+    token_buffer_ptr, # Size: [E, world_size, mxa, hidden_dim]
+    output_buffer_ptr, # Size: [S, hidden_dim]
+    token_sync_ptr, # Size: [E] int32 
+    E: tl.constexpr, world_size: tl.constexpr,
+    mxa: tl.constexpr, hidden_dim: tl.constexpr
+    BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
+):
+    expert = tl.program_id(0)
+    dev_id = tl.program_id(1)
+    token_id = tl.program_id(2)
 
+    ## We predicate some blocks off immediately. ##
+    num_tokens = tl.load(pca_ptr + (expert * world_size + dev_id).to(tl.int64))
 
+    if num_tokens < token_id:
+        return ## Immediately terminate.
 
-def step3_data_shuffle_triton(*args, **kwargs):
-    raise NotImplementedError("Step 3 (data shuffling / compaction) is not implemented in this file.")
+    ## Else, we have a non-zero token to shift to the output buffer. ##
 
+    ## We have to wait on the prior shmem puts to finish successfuly. 
+    while tl.load(token_sync_ptr + expert.to(tl.int64), volatile=True) < world_size:
+        pass 
+    
+    ## We loop over the hidden dimension and shift a token over to the output buffer. 
+    inp_ptrs = expert * world_size * mxa * hidden_dim + dev_id *  mxa * hidden_dim + token_id * hidden_dim + tl.arange(BLOCK_X)
+    cum_summed_prev = tl.load(pca_cumsum_ptr + (expert * world_size + dev_id).to(tl.int64))
+    packed_ptrs = (cum_summed_prev + token_id) * hidden_dim
+    for _ in tl.range(tl.cdiv(hidden_dim, BLOCK_X)):
 
-def step4_grouped_gemm_triton(*args, **kwargs):
-    raise NotImplementedError("Step 4 (grouped GEMM with per-expert spin-wait) is not implemented in this file.")
+        tkns = tl.load(token_buffer_ptr + inp_ptrs, mask=0)
+        tl.store(output_buffer_ptr + packed_ptrs, tkns)
 
+        packed_ptrs += BLOCK_X
+        inp_ptrs += BLOCK_X
 
+## Taken from triton docs, let's use this for a POC to get correctness prior to optimizing.
+@triton.jit
+def grouped_matmul_kernel(
+    # device tensor of matrices pointers
+    token_ptrs, # Shape: [S, hidden_dim].
+    expert_weights, # Shape: [hidden_dim, expert_hidden_dim]
+    output_ptrs, # Shape: [S, expert_hidden_dim]
+    expert_tkn_cnt_ptr, # Shape: [E], token count per expert.
+    # number of virtual SM
+    NUM_SM: tl.constexpr,
+    # number of gemms -> equivalent to local expert count.
+    expert_cnt: tl.contexpr,
+    hidden_dim: tl.constexpr,
+    expert_hidden_dim: tl.contexpr,
+    # tile sizes
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    tile_idx = tl.program_id(0)
+    last_problem_end = 0
+    for g in range(expert_cnt):
+        # get the gemm size of the current problem
+        gm = tl.load(expert_tkn_cnt_ptr + g)
+        gn = expert_hidden_dim
+        gk = hidden_dim
+        num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
+        num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
+        num_tiles = num_m_tiles * num_n_tiles
+        # iterate through the tiles in the current gemm problem
+        while (tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles):
+            # pick up a tile from the current gemm problem
+            k = gk
+            ## I think we can remove lines 286-291. ##
+            #lda = tl.load(g_lds + g * 3)
+            #ldb = tl.load(g_lds + g * 3 + 1)
+            #ldc = tl.load(g_lds + g * 3 + 2)
+            #a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))
+            #b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))
+            #c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
+            # figure out tile coordinates
+            tile_idx_in_gemm = tile_idx - last_problem_end
+            tile_m_idx = tile_idx_in_gemm // num_n_tiles
+            tile_n_idx = tile_idx_in_gemm % num_n_tiles
+
+            # do regular gemm here
+            offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            a_ptrs = token_ptrs + offs_am[:, None] * lda + offs_k[None, :]
+            b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
+                # hint to Triton compiler to do proper loop pipelining
+                tl.multiple_of(a_ptrs, [16, 16])
+                tl.multiple_of(b_ptrs, [16, 16])
+                # assume full tile for now
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
+                accumulator += tl.dot(a, b)
+                a_ptrs += BLOCK_SIZE_K
+                b_ptrs += BLOCK_SIZE_K * ldb
+            c = accumulator.to(tl.float16)
+
+            offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + ldc * offs_cm[:, None] + offs_cn[None, :]
+
+            # assumes full tile for now
+            tl.store(c_ptrs, c)
+
+            # go to the next tile by advancing NUM_SM
+            tile_idx += NUM_SM
+
+        # get ready to go to the next gemm problem
+        last_problem_end = last_problem_end + num_tiles
 
 # Step-1/2 run wrapper
-
-
 def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     """
     Prefix offsets within each destination block in send_payload.
@@ -248,7 +339,6 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     sc64 = send_counts.to(torch.int64)
     offs = (torch.cumsum(sc64, dim=1) - sc64).to(torch.int32)
     return offs.contiguous()
-
 
 def run_counts_and_tokens_exchange(
     #*,
@@ -306,7 +396,9 @@ def run_counts_and_tokens_exchange(
             buffers.counts_ready.zero_()
             buffers.token_sync.zero_()
 
-        # Step-1: counts
+    assert stream_comm, 'Incorrectly initialized stream_comm'
+    with torch.cuda.stream(stream_comm):
+        # Step-1: exchange token counts.
         iris_counts_exchange_kernel[(world_size,)](
             send_counts,
             buffers.pca,
@@ -319,7 +411,7 @@ def run_counts_and_tokens_exchange(
             num_warps=4,
         )
 
-        # Step-2: tokens
+        # Step-2: exchange tokens.
         iris_tokens_exchange_kernel[(world_size, e_local)](
             buffers.counts_ready,
             send_payload,
@@ -339,5 +431,33 @@ def run_counts_and_tokens_exchange(
             BLOCK_K=128,
             num_warps=8,
         )
+
+    ## We concurrently launch the compute kernels. ##
+
+    ## First, we aggregrate token counts and create a packed output buffer.
+    cum_summed_tkn_cnt = torch.roll(buffers.pca.view(-1).cumsum(), shifts=1)
+    total_tkn_cnt = cum_summed_tkn_cnt[-1]
+    output_buffer = torch.zeros((total_tkn_cnt, hidden_dim), dtype=send_payload.dtype).to(send_payload.device)
+    cum_summed_tkn_cnt[0] = 0
+    cum_summed_tkn_cnt = cum_summed_tkn_cnt.view(e_local, -1)
+    ## Next, launch token shuffling kernel. ##
+    grid = (e_local, world_size, buffers.token_buf.size(2))
+
+    ## Is this similar to megablocks' gather/scatter triton kernels? ##
+    token_shuffle[grid](
+        cum_summed_tkn_cnt, buffers.pca,
+        buffers.token_buf, 
+        output_buffer,
+        buffers.token_sync,
+        e_local, world_size,
+        buffers.token_buf.size(2), hidden_dim,
+        128
+    ) 
+    ## If the above is needed here, why is it not needed in Megablocks? 
+    ## Megablocks uses all_to_all_single which takes care of paddingless token transfers.
+    ## Figure out a way to ensure the multi-stage all_to_all can be zero-padding with shmem
+    ## as well.
+
+    # Finally, launch the grouped-gemm kernel.
 
     return buffers

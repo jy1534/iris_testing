@@ -12,8 +12,6 @@ import iris
 from kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
 from baseline import run_step12_baseline_ref, init_step12_baseline_buffers
 
-
-
 from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free
 
 

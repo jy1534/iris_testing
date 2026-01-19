@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,11 +6,7 @@ from typing import Optional, Tuple, Dict
 import torch
 import torch.distributed as dist
 
-
-
 # Utilities
-
-
 def _assert_cuda(x: torch.Tensor, name: str):
     if not x.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor (got device={x.device}).")
@@ -36,10 +30,8 @@ def _elapsed_ms(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
 
 
 # Persistent buffers
-
-
 @dataclass
-class Step12BaselineBuffers:
+class BaselineBuffers:
     # Counts buffers
     recv_counts: torch.Tensor            # [world_size, e_local] int32
     recv_counts_flat: torch.Tensor       # [world_size * e_local] int32
@@ -61,7 +53,7 @@ def init_step12_baseline_buffers(
     device: torch.device,
     total_recv: int,
     allocate_token_buf: bool = False,
-) -> Step12BaselineBuffers:
+) -> BaselineBuffers:
     """
     Allocate persistent buffers once, outside the timing loop.
     total_recv = sum over src of (sum_e recv_counts[src, e]) for the current iteration.
@@ -76,7 +68,7 @@ def init_step12_baseline_buffers(
     if allocate_token_buf:
         token_buf = torch.empty((e_local, world_size, capacity, hidden_dim), device=device, dtype=token_dtype)
 
-    return Step12BaselineBuffers(
+    return BaselineBuffers(
         recv_counts=recv_counts,
         recv_counts_flat=recv_counts_flat,
         out_splits=out_splits,
@@ -87,11 +79,9 @@ def init_step12_baseline_buffers(
 
 
 # Step-1 counts exchange (reference)
-
-
 def step1_exchange_counts_a2a(
     send_counts: torch.Tensor,
-    buffers: Step12BaselineBuffers,
+    buffers: BaselineBuffers,
     strict_capacity: bool,
     capacity: int,
 ) -> torch.Tensor:
@@ -127,13 +117,11 @@ def step1_exchange_counts_a2a(
 
 
 # Step-2 token exchange (reference)
-
-
 def step2_exchange_tokens_a2a(
     send_payload: torch.Tensor,
     send_counts: torch.Tensor,
     recv_counts: torch.Tensor,
-    buffers: Step12BaselineBuffers,
+    buffers: BaselineBuffers,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     send_payload: [sum_dst sum_e send_counts[dst,e], hidden_dim], packed by dst then expert (must match your packer)
@@ -183,8 +171,6 @@ def step2_exchange_tokens_a2a(
 
 
 # Optional reorder for correctness 
-
-
 def reorder_flat_to_token_buf(
     recv_payload_flat: torch.Tensor,
     recv_counts: torch.Tensor,
@@ -234,8 +220,6 @@ def reorder_flat_to_token_buf(
 
 
 # One-call runner (timed segments)
-
-
 def run_step12_baseline_ref(
     rank: int,
     world_size: int,
@@ -244,7 +228,7 @@ def run_step12_baseline_ref(
     hidden_dim: int,
     send_payload: torch.Tensor,
     send_counts: torch.Tensor,
-    buffers: Step12BaselineBuffers,
+    buffers: BaselineBuffers,
     do_reorder: bool = False,
     profile: bool = True,
     strict_capacity: bool = True,
