@@ -15,10 +15,7 @@ def _assert_int32(x: torch.Tensor, name: str):
     if x.dtype != torch.int32:
         raise ValueError(f"{name} must be int32 (got {x.dtype}).")
 
-def _cuda_event_timer(enabled: bool):
-    # returns (start_event, end_event) or (None, None)
-    if not enabled:
-        return None, None
+def _cuda_event_timer():
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     return start, end
@@ -44,7 +41,7 @@ class BaselineBuffers:
     token_buf: Optional[torch.Tensor]    # [e_local, world_size, capacity, hidden_dim] or None
 
 
-def init_step12_baseline_buffers(
+def init_baseline_buffers(
     world_size: int,
     e_local: int,
     capacity: int,
@@ -79,7 +76,7 @@ def init_step12_baseline_buffers(
 
 
 # Step-1 counts exchange (reference)
-def step1_exchange_counts_a2a(
+def exchange_counts_a2a(
     send_counts: torch.Tensor,
     buffers: BaselineBuffers,
     strict_capacity: bool,
@@ -117,7 +114,7 @@ def step1_exchange_counts_a2a(
 
 
 # Step-2 token exchange (reference)
-def step2_exchange_tokens_a2a(
+def exchange_payload_a2a(
     send_payload: torch.Tensor,
     send_counts: torch.Tensor,
     recv_counts: torch.Tensor,
@@ -220,7 +217,7 @@ def reorder_flat_to_token_buf(
 
 
 # One-call runner (timed segments)
-def run_step12_baseline_ref(
+def run_baseline_ref(
     rank: int,
     world_size: int,
     e_local: int,
@@ -230,16 +227,11 @@ def run_step12_baseline_ref(
     send_counts: torch.Tensor,
     buffers: BaselineBuffers,
     do_reorder: bool = False,
-    profile: bool = True,
+    profile: bool = True,          # no longer use
     strict_capacity: bool = True,
     barrier: bool = True,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float], Dict[str, torch.Tensor]]:
-    """
-    Returns:
-      token_buf (if do_reorder and buffers.token_buf is allocated) else None,
-      timings dict: step1_ms, step2_ms, reorder_ms (if enabled)
-      meta dict: recv_counts, in_splits, out_splits, total_send, total_recv
-    """
+
     _assert_cuda(send_payload, "send_payload")
     _assert_cuda(send_counts, "send_counts")
     _assert_int32(send_counts, "send_counts")
@@ -247,71 +239,54 @@ def run_step12_baseline_ref(
     if send_counts.shape != (world_size, e_local):
         raise ValueError(f"send_counts shape {tuple(send_counts.shape)} != ({world_size},{e_local})")
 
-    # Timers
     t: Dict[str, float] = {}
     meta: Dict[str, torch.Tensor] = {}
 
-    # Step1 counts 
+    # Step1 counts
     if barrier:
         dist.barrier()
     torch.cuda.synchronize()
 
-    s1, e1 = _cuda_event_timer(profile)
-    if profile:
-        s1.record()
-
-    recv_counts = step1_exchange_counts_a2a(send_counts, buffers, strict_capacity=strict_capacity, capacity=capacity)
-
-    if profile:
-        e1.record()
-        t["step1_ms"] = _elapsed_ms(s1, e1)
-    else:
-        t["step1_ms"] = 0.0
-
+    s1, e1 = _cuda_event_timer()
+    s1.record()
+    recv_counts = exchange_counts_a2a(send_counts, buffers, strict_capacity=strict_capacity, capacity=capacity)
+    e1.record()
+    t["step1_ms"] = _elapsed_ms(s1, e1)
     meta["recv_counts"] = recv_counts
 
-    # Step2 tokens 
+    # Step2 tokens
     if barrier:
         dist.barrier()
     torch.cuda.synchronize()
 
-    s2, e2 = _cuda_event_timer(profile)
-    if profile:
-        s2.record()
-
-    recv_payload_flat, in_splits, out_splits = step2_exchange_tokens_a2a(
+    s2, e2 = _cuda_event_timer()
+    s2.record()
+    recv_payload_flat, in_splits, out_splits = exchange_payload_a2a(
         send_payload=send_payload,
         send_counts=send_counts,
         recv_counts=recv_counts,
         buffers=buffers,
     )
-
-    if profile:
-        e2.record()
-        t["step2_ms"] = _elapsed_ms(s2, e2)
-    else:
-        t["step2_ms"] = 0.0
+    e2.record()
+    t["step2_ms"] = _elapsed_ms(s2, e2)
 
     meta["in_splits"] = in_splits
     meta["out_splits"] = out_splits
     meta["total_send"] = in_splits.sum()
     meta["total_recv"] = out_splits.sum()
 
-    # Optional reorder
+    # Optional reorder (correctness scaffold)
     token_buf = None
     if do_reorder:
         if buffers.token_buf is None:
             raise ValueError("do_reorder=True but buffers.token_buf is None. Allocate with allocate_token_buf=True.")
+
         torch.cuda.synchronize()
-        s3, e3 = _cuda_event_timer(profile)
-        if profile:
-            s3.record()
+        s3, e3 = _cuda_event_timer()
+        s3.record()
         token_buf = reorder_flat_to_token_buf(recv_payload_flat, recv_counts, capacity, buffers.token_buf)
-        if profile:
-            e3.record()
-            t["reorder_ms"] = _elapsed_ms(s3, e3)
-        else:
-            t["reorder_ms"] = 0.0
+        e3.record()
+        t["reorder_ms"] = _elapsed_ms(s3, e3)
     else:
         t["reorder_ms"] = 0.0
 

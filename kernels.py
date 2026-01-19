@@ -160,7 +160,7 @@ def iris_tokens_exchange_kernel(
             src_rank,
             heap_bases,
             sem="acquire",
-            scope="gpu",
+            scope="sys", #same as first one
         )
     # How many rows to send for this (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
@@ -396,9 +396,7 @@ def run_counts_and_tokens_exchange(
             buffers.counts_ready.zero_()
             buffers.token_sync.zero_()
 
-    assert stream_comm, 'Incorrectly initialized stream_comm'
-    with torch.cuda.stream(stream_comm):
-        # Step-1: exchange token counts.
+        # Step-1: counts
         iris_counts_exchange_kernel[(world_size,)](
             send_counts,
             buffers.pca,
@@ -411,7 +409,7 @@ def run_counts_and_tokens_exchange(
             num_warps=4,
         )
 
-        # Step-2: exchange tokens.
+        # Step-2: tokens
         iris_tokens_exchange_kernel[(world_size, e_local)](
             buffers.counts_ready,
             send_payload,
@@ -431,33 +429,5 @@ def run_counts_and_tokens_exchange(
             BLOCK_K=128,
             num_warps=8,
         )
-
-    ## We concurrently launch the compute kernels. ##
-
-    ## First, we aggregrate token counts and create a packed output buffer.
-    cum_summed_tkn_cnt = torch.roll(buffers.pca.view(-1).cumsum(), shifts=1)
-    total_tkn_cnt = cum_summed_tkn_cnt[-1]
-    output_buffer = torch.zeros((total_tkn_cnt, hidden_dim), dtype=send_payload.dtype).to(send_payload.device)
-    cum_summed_tkn_cnt[0] = 0
-    cum_summed_tkn_cnt = cum_summed_tkn_cnt.view(e_local, -1)
-    ## Next, launch token shuffling kernel. ##
-    grid = (e_local, world_size, buffers.token_buf.size(2))
-
-    ## Is this similar to megablocks' gather/scatter triton kernels? ##
-    token_shuffle[grid](
-        cum_summed_tkn_cnt, buffers.pca,
-        buffers.token_buf, 
-        output_buffer,
-        buffers.token_sync,
-        e_local, world_size,
-        buffers.token_buf.size(2), hidden_dim,
-        128
-    ) 
-    ## If the above is needed here, why is it not needed in Megablocks? 
-    ## Megablocks uses all_to_all_single which takes care of paddingless token transfers.
-    ## Figure out a way to ensure the multi-stage all_to_all can be zero-padding with shmem
-    ## as well.
-
-    # Finally, launch the grouped-gemm kernel.
 
     return buffers
