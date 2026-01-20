@@ -218,8 +218,8 @@ def token_shuffle(
     output_buffer_ptr, # Size: [S, hidden_dim]
     token_sync_ptr, # Size: [E] int32 
     E: tl.constexpr, world_size: tl.constexpr,
-    mxa: tl.constexpr, hidden_dim: tl.constexpr
-    BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
+    mxa: tl.constexpr, hidden_dim: tl.constexpr,
+    BLOCK_X: tl.constexpr,  ## We have 1-d blocks only.
 ):
     expert = tl.program_id(0)
     dev_id = tl.program_id(1)
@@ -260,9 +260,9 @@ def grouped_matmul_kernel(
     # number of virtual SM
     NUM_SM: tl.constexpr,
     # number of gemms -> equivalent to local expert count.
-    expert_cnt: tl.contexpr,
+    expert_cnt: tl.constexpr,
     hidden_dim: tl.constexpr,
-    expert_hidden_dim: tl.contexpr,
+    expert_hidden_dim: tl.constexpr,
     # tile sizes
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -429,5 +429,34 @@ def run_counts_and_tokens_exchange(
             BLOCK_K=128,
             num_warps=8,
         )
+    ## We concurrently launch the compute kernels. ##
+
+    ## First, we aggregrate token counts and create a packed output buffer.
+    cum_summed_tkn_cnt = torch.roll(buffers.pca.view(-1).cumsum(), shifts=1)
+    total_tkn_cnt = cum_summed_tkn_cnt[-1]
+    output_buffer = torch.zeros((total_tkn_cnt, hidden_dim), dtype=send_payload.dtype).to(send_payload.device)
+    cum_summed_tkn_cnt[0] = 0
+    cum_summed_tkn_cnt = cum_summed_tkn_cnt.view(e_local, -1)
+    ## Next, launch token shuffling kernel. ##
+    grid = (e_local, world_size, buffers.token_buf.size(2))
+
+    ## Is this similar to megablocks' gather/scatter triton kernels? ##
+    token_shuffle[grid](
+        cum_summed_tkn_cnt, buffers.pca,
+        buffers.token_buf, 
+        output_buffer,
+        buffers.token_sync,
+        e_local, world_size,
+        buffers.token_buf.size(2), hidden_dim,
+        128
+    ) 
+    ## If the above is needed here, why is it not needed in Megablocks? 
+    ## Megablocks uses all_to_all_single which takes care of paddingless token transfers.
+    ## Figure out a way to ensure the multi-stage all_to_all can be zero-padding with shmem
+    ## as well.
+
+    # Finally, launch the grouped-gemm kernel.
 
     return buffers
+
+

@@ -231,7 +231,12 @@ def run_baseline_ref(
     strict_capacity: bool = True,
     barrier: bool = True,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float], Dict[str, torch.Tensor]]:
-
+    """
+    Returns:
+      token_buf (if do_reorder and buffers.token_buf is allocated) else None,
+      timings dict: step1_ms, step2_ms, reorder_ms (if enabled)
+      meta dict: recv_counts, in_splits, out_splits, total_send, total_recv
+    """
     _assert_cuda(send_payload, "send_payload")
     _assert_cuda(send_counts, "send_counts")
     _assert_int32(send_counts, "send_counts")
