@@ -104,8 +104,9 @@ def iris_counts_exchange_kernel(
         # Remote write: pca[e, src_rank] on destination.
         remote_ptr = pca_ptr + e * world_size + src_rank
         iris.put(
-            remote_ptr,
             vals,
+            remote_ptr,
+            # change in case of error
             src_rank,
             dst,
             heap_bases,
@@ -189,8 +190,9 @@ def iris_tokens_exchange_kernel(
 
             remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
             iris.put(
-                remote_ptrs,
                 x,
+                remote_ptrs,
+                # same reason as iris.put above
                 src_rank,
                 dst,
                 heap_bases,

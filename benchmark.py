@@ -102,8 +102,9 @@ def check_compare(
     base_seed: int,
 ):
     # init process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+   #torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
 
     set_seed(base_seed, rank)
