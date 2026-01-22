@@ -55,7 +55,7 @@ class AllToAllOp(torch.autograd.Function):
 
         assert experts % world_size, 'EP-group size unevenly calculated.'
 
-        iris_counts_exchange_kernel[(world_size,)](
+        counts_exchange_kernel[(world_size,)](
             dest_counts,
             local_pca,
             counts_sync,
@@ -71,7 +71,7 @@ class AllToAllOp(torch.autograd.Function):
         output_buffer = torch.zeros((experts // world_size, world_size, capacity, tokens.shape[-1]))
 
         # Step-2: exchange tokens.
-        iris_tokens_exchange_kernel[(world_size, experts // world_size)](
+        tokens_exchange_kernel[(world_size, experts // world_size)](
             counts_sync,
             tokens,
             dest_counts,
