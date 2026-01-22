@@ -10,7 +10,7 @@ import triton.language as tl
 import iris
 
 from kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
-from baseline import run_step12_baseline_ref, init_step12_baseline_buffers
+from baseline import run_baseline_ref, init_baseline_buffers
 
 from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free
 
@@ -90,7 +90,7 @@ def _masked_stats(
     return max_diff, sum_triton, sum_torch
 
 
-def check_step12(
+def check_compare(
     rank: int,
     world_size: int,
     batch: int,
@@ -102,8 +102,9 @@ def check_step12(
     base_seed: int,
 ):
     # init process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+   #torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
 
     set_seed(base_seed, rank)
@@ -179,7 +180,7 @@ def check_step12(
     # run baseline
      # total_recv is known from counts_all (should match what step1 will produce)
     total_recv = int(counts_all[:, rank, :].sum().item())
-    base_buffers = init_step12_baseline_buffers(
+    base_buffers = init_baseline_buffers(
         world_size=world_size,
         e_local=e_local,
         capacity=capacity,
@@ -190,7 +191,7 @@ def check_step12(
         allocate_token_buf=True,
     )
 
-    torch_out, _, _ = run_step12_baseline_ref(
+    torch_out, _, _ = run_baseline_ref(
         rank=rank,
         world_size=world_size,
         e_local=e_local,
@@ -256,7 +257,7 @@ if __name__ == "__main__":
     os.environ.setdefault("MASTER_PORT", "29500")
 
     mp.spawn(
-        check_step12,
+        check_compare,
         args=(world_size, batch, seq, hidden_dim, topk, e_local, capacity, seed),
         nprocs=world_size,
         join=True,
