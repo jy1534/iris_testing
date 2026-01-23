@@ -1,3 +1,4 @@
+from __future__ import annotations
 import math
 import random
 from typing import Tuple, List
@@ -5,6 +6,10 @@ from typing import Tuple, List
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+
+from dataclasses import dataclass
+
+
 
 def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
     
@@ -25,6 +30,7 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     offs = (torch.cumsum(sc64, dim=1) - sc64).to(torch.int32)
     return offs.contiguous()
 
+
 @dataclass
 class ShmemBuffers:
     # Step-1 outputs / sync
@@ -38,7 +44,7 @@ class ShmemBuffers:
     # Cached heap bases (IRIS addressing)
     heap_bases: torch.Tensor
 
-
+    
 def alloc_shmem_buffers(
     shmem,
     world_size: int,
@@ -72,6 +78,49 @@ def alloc_shmem_buffers(
         token_sync=token_sync,
         heap_bases=heap_bases,
     )
+class CountsBuffers:
+    pca: torch.Tensor
+    counts_ready: torch.Tensor
+    heap_bases: torch.Tensor
+
+def reset_counts_sync(cb: CountsBuffers) -> None:
+    cb.counts_ready.zero_()
+
+def reset_token_sync(tb: TokenBuffers) -> None:
+    tb.token_sync.zero_()
+
+def reset_token_buf_debug(tb: TokenBuffers) -> None:
+    tb.token_buf.zero_()
+
+@dataclass
+class TokenBuffers:
+    token_buf: torch.Tensor
+    token_sync: torch.Tensor
+
+def alloc_counts_buffers(shmem, world_size: int, e_local: int) -> CountsBuffers:
+    pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
+    counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
+    heap_bases = shmem.get_heap_bases()
+    return CountsBuffers(pca=pca, counts_ready=counts_ready, heap_bases=heap_bases)
+
+def alloc_token_buffers(
+    shmem,
+    world_size: int,
+    e_local: int,
+    capacity: int,
+    hidden_dim: int,
+    token_dtype: torch.dtype,
+) -> TokenBuffers:
+    token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
+    token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
+    return TokenBuffers(token_buf=token_buf, token_sync=token_sync)
+
+def compute_capacity_from_pca(pca: torch.Tensor) -> int:
+    cap = pca.max().to(torch.int32)
+    dist.all_reduce(cap, op=dist.ReduceOp.MAX)
+    return max(int(cap.item()), 1)
+
+
 
 def set_seed(base_seed: int, rank: int) -> None:
     #Use different seeds per-rank for token generation / routing decisions.
