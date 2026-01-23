@@ -7,8 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import ShmemBuffers, build_expert_offsets
-
 import iris
 
 """
@@ -18,44 +16,10 @@ CAP = max_{e,s} pca[e,s]
 Capcity in real moe 
 """
 
-def alloc_shmem_buffers(
-    #*,
-    shmem,
-    world_size: int,
-    e_local: int,
-    capacity: int,
-    hidden_dim: int,
-    token_dtype: torch.dtype,
-) -> ShmemBuffers:
-    """
-    Allocate symmetric buffers with fixed shapes.
-    """
-
-    # pca[e, src] = counts for this device's local expert e sent by src
-    pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
-
-    # counts_ready becomes == world_size once all senders finished writing counts.
-    counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
-
-    # token_buf[e, src, m, :] (m in [0, CAP)) holds tokens from src for expert e.
-    token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
-
-    # token_sync[e] becomes == world_size once all senders finished sending tokens for expert e.
-    token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
-
-    heap_bases = shmem.get_heap_bases()
-
-    return ShmemBuffers(
-        pca=pca,
-        counts_ready=counts_ready,
-        token_buf=token_buf,
-        token_sync=token_sync,
-        heap_bases=heap_bases,
-    )
 
 # Step-1 kernel: counts exchange
 @triton.jit
-def iris_counts_exchange_kernel(
+def counts_exchange_kernel(
     send_counts_ptr,  # [world, E] int32 (local)
     pca_ptr,  # [E, world] int32 (symmetric on dst)
     counts_ready_ptr,  # [1] int32 (symmetric on dst)
@@ -76,7 +40,7 @@ def iris_counts_exchange_kernel(
         mask_e = e < e_local
 
         # Local read: send_counts[dst, e]
-        vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
+        #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
         src_ptr = send_counts_ptr + dst * e_local + e  # new pointer
@@ -103,14 +67,13 @@ def iris_counts_exchange_kernel(
 
 # Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
 @triton.jit
-def iris_tokens_exchange_kernel(
-    counts_ready_ptr,      # [1] int32 local
-    send_ptr,
-    send_counts_ptr,
-    dst_offsets_ptr,
-    expert_offs_ptr,
-    token_buf_ptr,
-    token_sync_ptr,
+def tokens_exchange_kernel(
+    send_ptr,   # [sum_send, H]
+    send_counts_ptr,    # [W, E] int32 local
+    dst_offsets_ptr,    # [W] int32 local
+    expert_offs_ptr,    # [W, E] int32 local
+    token_buf_ptr,  # [E, W, CAP, H] symmetric on dst
+    token_sync_ptr, # [E] int32 symmetric on dst
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -118,28 +81,12 @@ def iris_tokens_exchange_kernel(
     e_local: tl.constexpr,
     CAP: tl.constexpr,
     hidden_dim: tl.constexpr,
-    EXPECTED: tl.constexpr,   # NEW
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     dst = tl.program_id(0) # destination rank
     expert = tl.program_id(1) # destination-local expert index
 
-    # Only enforce local acquire on the receiver-side programs (dst == this rank)
-    if dst == src_rank:
-        while tl.load(counts_ready_ptr, volatile=True).to(tl.int32) < EXPECTED:
-            pass
-
-        # Acquire fence (local): pair with remote release increments on dst counts_ready.
-        iris.atomic_add(
-            counts_ready_ptr,
-            0,
-            src_rank,
-            src_rank,
-            heap_bases,
-            sem="acquire",
-            scope="sys", #same as first one
-        )
     # How many rows to send for this (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
@@ -330,96 +277,3 @@ def grouped_gemm(
         last_problem_end = last_problem_end + num_tiles
 
 
-def run_counts_and_tokens_exchange(
-    #*,
-    rank: int,
-    world_size: int,
-    send_payload: torch.Tensor,  # [sum_send, H]
-    send_counts: torch.Tensor,  # [world, E] int32
-    dst_offsets: torch.Tensor,  # [world] int32
-    buffers: ShmemBuffers,
-    e_local: int,
-    capacity: int,
-    hidden_dim: int,
-    stream_comm: Optional[torch.cuda.Stream] = None,
-    # Two options for sync variables:
-    #  - clear_local_counters=True: zero counters every iteration (simple)
-    #  - clear_local_counters=False: use a monotonic epoch and wait for (iter_idx+1)*world_size
-    clear_local_counters: bool = True,
-    iter_idx: int = 0,
-) -> ShmemBuffers:
-    """
-    Execute Step-1 and Step-2 kernels on the provided comm stream.
-    """
-
-    _assert_cuda_int32(send_counts, "send_counts")
-    _assert_cuda_int32(dst_offsets, "dst_offsets")
-
-    if send_counts.shape != (world_size, e_local):
-        raise ValueError(
-            f"send_counts must have shape [world={world_size}, E={e_local}], got {tuple(send_counts.shape)}"
-        )
-
-    # Capacity is a fixed upper bound (padded buffer contract).
-    max_pair = int(send_counts.max().item()) if send_counts.numel() else 0
-    if max_pair > capacity:
-        raise ValueError(
-            f"CAP too small: max send_counts[dst,e] on rank {rank} is {max_pair}, but CAP={capacity}. "
-            "Increase CAP to satisfy the padded buffer contract."
-        )
-
-    expert_offs = build_expert_offsets(send_counts)
-
-    # Decide the expected value for the receiver-side counters.
-    expected = world_size if clear_local_counters else (iter_idx + 1) * world_size
-
-    # CHANGED: Defensive coding: require comm stream, remove predication / duplicated branches.
-    if stream_comm is None:
-        raise ValueError(
-            "stream_comm must be provided. We always run comm kernels on a dedicated comm stream."
-        )
-
-    # CHANGED: Single stream region, no duplicated code.
-    with torch.cuda.stream(stream_comm):
-        # Reset receiver-side counters if using the simple per-iter reset mode.
-        if clear_local_counters:
-            buffers.counts_ready.zero_()
-            buffers.token_sync.zero_()
-
-    assert stream_comm, 'Incorrectly initialized stream_comm'
-    with torch.cuda.stream(stream_comm):
-        # Step-1: exchange token counts.
-        counts_exchange_kernel[(world_size,)](
-            send_counts,
-            buffers.pca,
-            buffers.counts_ready,
-            buffers.heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            BLOCK_E=128,
-            num_warps=4,
-        )
-
-        # Step-2: exchange tokens.
-        tokens_exchange_kernel[(world_size, e_local)](
-            buffers.counts_ready,
-            send_payload,
-            send_counts,
-            dst_offsets,
-            expert_offs,
-            buffers.token_buf,
-            buffers.token_sync,
-            buffers.heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            CAP=capacity,
-            hidden_dim=hidden_dim,
-            EXPECTED=expected,
-            BLOCK_M=32,
-            BLOCK_K=128,
-            num_warps=8,
-        )
-
-    return buffers
