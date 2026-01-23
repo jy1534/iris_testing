@@ -7,8 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import ShmemBuffers, build_expert_offsets
-
 import iris
 
 """
@@ -18,13 +16,15 @@ CAP = max_{e,s} pca[e,s]
 Capcity in real moe 
 """
 
-# Step-1 kernel: exchange token counts. 
+
+# Step-1 kernel: counts exchange
 @triton.jit
 def counts_exchange_kernel(
     send_counts_ptr,  # [world, E] int32 (local)
     pca_ptr,  # [E, world] int32 (symmetric on dst)
     counts_ready_ptr,  # [1] int32 (symmetric on dst)
     heap_bases,
+    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -40,17 +40,18 @@ def counts_exchange_kernel(
         mask_e = e < e_local
 
         # Local read: send_counts[dst, e]
-        vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
+        #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
+        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer
         remote_ptr = pca_ptr + e * world_size + src_rank
         iris.put(
-            remote_ptr,
-            vals,
-            src_rank,
-            dst,
-            heap_bases,
-            mask=mask_e,
+            src_ptr,            # from_ptr: pointer
+            remote_ptr,         # to_ptr: pointer
+            from_rank=src_rank,
+            to_rank=dst,
+            heap_bases=heap_bases,
+            mask=mask_e,        
         )
 
     # Signal completion to destination (release semantics).
@@ -64,44 +65,28 @@ def counts_exchange_kernel(
         scope="sys",
     )
 
-# Step-2 kernel: token exchange (with local spin-wait on counts_ready).
+# Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
 @triton.jit
 def tokens_exchange_kernel(
-    counts_ready_ptr,  # [1] int32 local
-    send_ptr,
-    send_counts_ptr,
-    dst_offsets_ptr,
-    expert_offs_ptr,
-    token_buf_ptr,
-    token_sync_ptr,
+    send_ptr,   # [sum_send, H]
+    send_counts_ptr,    # [W, E] int32 local
+    dst_offsets_ptr,    # [W] int32 local
+    expert_offs_ptr,    # [W, E] int32 local
+    token_buf_ptr,  # [E, W, CAP, H] symmetric on dst
+    token_sync_ptr, # [E] int32 symmetric on dst
     heap_bases,
+    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
     CAP: tl.constexpr,
     hidden_dim: tl.constexpr,
-    EXPECTED: tl.constexpr,   # NEW
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     dst = tl.program_id(0) # destination rank
     expert = tl.program_id(1) # destination-local expert index
 
-    # Only enforce local acquire on the receiver-side programs (dst == this rank)
-    if dst == src_rank:
-        while tl.load(counts_ready_ptr, volatile=True).to(tl.int32) < EXPECTED:
-            pass
-
-        # Acquire fence (local): pair with remote release increments on dst counts_ready.
-        iris.atomic_add(
-            counts_ready_ptr,
-            0,
-            src_rank,
-            src_rank,
-            heap_bases,
-            sem="acquire",
-            scope="gpu",
-        )
     # How many rows to send for this (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
@@ -120,20 +105,19 @@ def tokens_exchange_kernel(
         m_mask = offs_m < n
         row_ids = (send_base + offs_m).to(tl.int32)
 
-        for k0 in tl.static_range(0, tl.cdiv(hidden_dim, BLOCK_K)):
-            offs_k = k0 * BLOCK_K + tl.arange(0, BLOCK_K)
+        for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
             k_mask = offs_k < hidden_dim
 
             send_ptrs = send_ptr + row_ids[:, None] * hidden_dim + offs_k[None, :]
-            x = tl.load(send_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-
             remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
+
             iris.put(
-                remote_ptrs,
-                x,
-                src_rank,
-                dst,
-                heap_bases,
+                send_ptrs,      # new pointer
+                remote_ptrs,    # new pointer
+                from_rank=src_rank,
+                to_rank=dst,
+                heap_bases=heap_bases,
                 mask=m_mask[:, None] & k_mask[None, :],
             )
 
@@ -148,6 +132,8 @@ def tokens_exchange_kernel(
         sem="release",
         scope="sys",
     )
+
+    
 
 @triton.jit
 def token_shuffle(
@@ -291,96 +277,3 @@ def grouped_gemm(
         last_problem_end = last_problem_end + num_tiles
 
 
-def run_counts_and_tokens_exchange(
-    #*,
-    rank: int,
-    world_size: int,
-    send_payload: torch.Tensor,  # [sum_send, H]
-    send_counts: torch.Tensor,  # [world, E] int32
-    dst_offsets: torch.Tensor,  # [world] int32
-    buffers: ShmemBuffers,
-    e_local: int,
-    capacity: int,
-    hidden_dim: int,
-    stream_comm: Optional[torch.cuda.Stream] = None,
-    # Two options for sync variables:
-    #  - clear_local_counters=True: zero counters every iteration (simple)
-    #  - clear_local_counters=False: use a monotonic epoch and wait for (iter_idx+1)*world_size
-    clear_local_counters: bool = True,
-    iter_idx: int = 0,
-) -> ShmemBuffers:
-    """
-    Execute Step-1 and Step-2 kernels on the provided comm stream.
-    """
-
-    _assert_cuda_int32(send_counts, "send_counts")
-    _assert_cuda_int32(dst_offsets, "dst_offsets")
-
-    if send_counts.shape != (world_size, e_local):
-        raise ValueError(
-            f"send_counts must have shape [world={world_size}, E={e_local}], got {tuple(send_counts.shape)}"
-        )
-
-    # Capacity is a fixed upper bound (padded buffer contract).
-    max_pair = int(send_counts.max().item()) if send_counts.numel() else 0
-    if max_pair > capacity:
-        raise ValueError(
-            f"CAP too small: max send_counts[dst,e] on rank {rank} is {max_pair}, but CAP={capacity}. "
-            "Increase CAP to satisfy the padded buffer contract."
-        )
-
-    expert_offs = build_expert_offsets(send_counts)
-
-    # Decide the expected value for the receiver-side counters.
-    expected = world_size if clear_local_counters else (iter_idx + 1) * world_size
-
-    # CHANGED: Defensive coding: require comm stream, remove predication / duplicated branches.
-    if stream_comm is None:
-        raise ValueError(
-            "stream_comm must be provided. We always run comm kernels on a dedicated comm stream."
-        )
-
-    # CHANGED: Single stream region, no duplicated code.
-    with torch.cuda.stream(stream_comm):
-        # Reset receiver-side counters if using the simple per-iter reset mode.
-        if clear_local_counters:
-            buffers.counts_ready.zero_()
-            buffers.token_sync.zero_()
-
-    assert stream_comm, 'Incorrectly initialized stream_comm'
-    with torch.cuda.stream(stream_comm):
-        # Step-1: exchange token counts.
-        counts_exchange_kernel[(world_size,)](
-            send_counts,
-            buffers.pca,
-            buffers.counts_ready,
-            buffers.heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            BLOCK_E=128,
-            num_warps=4,
-        )
-
-        # Step-2: exchange tokens.
-        tokens_exchange_kernel[(world_size, e_local)](
-            buffers.counts_ready,
-            send_payload,
-            send_counts,
-            dst_offsets,
-            expert_offs,
-            buffers.token_buf,
-            buffers.token_sync,
-            buffers.heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            CAP=capacity,
-            hidden_dim=hidden_dim,
-            EXPECTED=expected,
-            BLOCK_M=32,
-            BLOCK_K=128,
-            num_warps=8,
-        )
-
-    return buffers
