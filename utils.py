@@ -78,6 +78,8 @@ def alloc_shmem_buffers(
         token_sync=token_sync,
         heap_bases=heap_bases,
     )
+    
+@dataclass
 class CountsBuffers:
     pca: torch.Tensor
     counts_ready: torch.Tensor
