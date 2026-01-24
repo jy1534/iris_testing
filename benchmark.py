@@ -5,52 +5,20 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import triton
-import triton.language as tl
 import iris
 
-from kernels import run_counts_and_tokens_exchange, alloc_shmem_buffers
+import time
 from baseline import run_baseline_ref, init_baseline_buffers
 
-from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free
+from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free, alloc_shmem_buffe
 
+from  .layers.all_to_all import custom_a2a
 
 def _init_iris_shmem():
     import iris, os
     heap_gib = int(os.getenv("IRIS_HEAP_GIB", "100"))
     heap_size = heap_gib * (2**30)
     return iris.iris(heap_size)
-
-
-@triton.jit
-def iris_wait_token_sync_kernel(
-    token_sync_ptr,
-    heap_bases,
-    *,
-    src_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    e_local: tl.constexpr,
-):
-  
-    e = tl.program_id(0)
-    if e >= e_local:
-        return
-
-    # Spin (device-side) until all senders have signaled.
-    while tl.load(token_sync_ptr + e, volatile=True).to(tl.int32) < world_size:
-        pass
-
-    # Acquire fence: "self" atomic with acquire semantics.
-    iris.atomic_add(
-        token_sync_ptr + e,
-        0,
-        src_rank,
-        src_rank,
-        heap_bases,
-        sem="acquire",
-        scope="sys",
-    )
-
 
 def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
     """dst_offsets[dst] = prefix sum of total tokens to earlier destinations."""
@@ -142,40 +110,37 @@ def check_compare(
     if os.getenv("CLEAR_TOKEN_BUF", "0") == "1":
         buffers.token_buf.zero_()
 
-    dist.barrier()
+    # NOTE: no dist.barrier(); use shmem.barrier() for sync/fence
 
     dst_offsets = _build_dst_offsets(send_counts)
 
-    comm_stream = torch.cuda.Stream(device=device)
-    # run custom step1/2
-    run_counts_and_tokens_exchange(
-        rank=rank,
-        world_size=world_size,
-        send_payload=send_payload,
-        send_counts=send_counts,
-        dst_offsets=dst_offsets,
-        buffers=buffers,
-        e_local=e_local,
-        capacity=capacity,
-        hidden_dim=hidden_dim,
-        #stream_comm=None,
-        stream_comm = comm_stream
+    # seros the variables
+    buffers.pca.zero_()
+    buffers.counts_ready.zero_()
+    buffers.token_sync.zero_()
+    if os.getenv("CLEAR_TOKEN_BUF", "0") == "1":
+        buffers.token_buf.zero_()
 
-    )
-    comm_stream.synchronize()  
-    # Ensure all ranks have launched/completed their kernels before we start waiting locally.
-    dist.barrier()
+    # timing take layer wrapper + shmem.barrier() as a whole
+    t0 = time.perf_counter()
 
-    # Device-side wait for token_sync (per expert) + acquire fence.
-    iris_wait_token_sync_kernel[(e_local,)](
+    _ = custom_a2a(
+        send_payload,        # tokens
+        send_counts,         # dest_counts
+        dst_offsets,
+        buffers.pca,
+        buffers.token_buf,
+        buffers.counts_ready,
         buffers.token_sync,
         buffers.heap_bases,
-        src_rank=rank,
-        world_size=world_size,
-        e_local=e_local,
-        num_warps=1,
+        experts=num_experts_total,   # pass “global experts”
+        capacity=capacity,
     )
-    torch.cuda.synchronize()
+
+    shmem.barrier()
+
+    t1 = time.perf_counter()
+    layer_ms = (t1 - t0) * 1e3
 
     # run baseline
      # total_recv is known from counts_all (should match what step1 will produce)
