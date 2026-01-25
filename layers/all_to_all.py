@@ -4,8 +4,9 @@ import torch.distributed as dist
 # from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
 
 
-from ..kernels import counts_exchange_kernel, tokens_exchange_kernel
-from ..utils import build_expert_offsets, _assert_cuda_int32
+from kernels import counts_exchange_kernel, tokens_exchange_kernel
+from utils import build_expert_offsets, _assert_cuda_int32
+
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -97,7 +98,8 @@ class AllToAllOp(torch.autograd.Function):
 
         # Stage-2: token exchange
         expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) :contentReference[oaicite:11]{index=11}
-        tokens_exchange_kernel[(world_size, e_local)](
+        grid_m = triton.cdiv(capacity, 32)   # BLOCK_M=32
+        tokens_exchange_kernel[(world_size, e_local, grid_m)](
             tokens,
             dest_counts,
             dst_offsets,
