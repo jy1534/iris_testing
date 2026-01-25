@@ -86,7 +86,9 @@ def tokens_exchange_kernel(
 ):
     dst = tl.program_id(0) # destination rank
     expert = tl.program_id(1) # destination-local expert index
-
+    pid_m = tl.program_id(2)     # parallel dimension over (m, k-tile)
+    
+    
     # How many rows to send for this (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
@@ -99,30 +101,40 @@ def tokens_exchange_kernel(
     # Flatten: (((expert * world + src_rank) * CAP + m) * H + k)
     remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
 
-    # Copy up to CAP rows; rows beyond n are masked (padding remains zero)
-    for m0 in tl.static_range(0, CAP, BLOCK_M):
-        offs_m = m0 + tl.arange(0, BLOCK_M)
-        m_mask = offs_m < n
-        row_ids = (send_base + offs_m).to(tl.int32)
+     # Copy up to CAP rows; rows beyond n are masked (padding remains zero)
+    # NOTE: CAP dimension is now parallelized via pid_m, so we don't unroll over CAP.
+    m0 = pid_m * BLOCK_M
+    offs_m = m0 + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < n
 
-        for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < hidden_dim
+    # IMPORTANT: avoid forming out-of-bounds pointers for masked lanes.
+    # Some lower-level put implementations may still touch addresses even when masked.
+    safe_row = tl.where(m_mask, send_base + offs_m, 0).to(tl.int32)
 
-            send_ptrs = send_ptr + row_ids[:, None] * hidden_dim + offs_k[None, :]
-            remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
+    # Early exit: if this tile is entirely out of range, do nothing (no sync increment).
+    
+    if not tl.any(m_mask):
+        return
 
-            iris.put(
-                send_ptrs,      # new pointer
-                remote_ptrs,    # new pointer
-                from_rank=src_rank,
-                to_rank=dst,
-                heap_bases=heap_bases,
-                mask=m_mask[:, None] & k_mask[None, :],
-            )
+    # Hidden-dim tiling: shift across hidden dimension.
+    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < hidden_dim
+
+        send_ptrs = send_ptr + safe_row[:, None] * hidden_dim + offs_k[None, :]
+        remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
+
+        iris.put(
+            send_ptrs,
+            remote_ptrs,
+            from_rank=src_rank,
+            to_rank=dst,
+            heap_bases=heap_bases,
+            mask=m_mask[:, None] & k_mask[None, :],
+        )
 
     # Signal completion for this expert on destination (release semantics).
-    # IMPORTANT: even if n == 0, we still increment once so dst can reach world_size.
+    # IMPORTANT: this now signals *one CAP-tile (BLOCK_M rows)* completion, not one src completion.
     iris.atomic_add(
         token_sync_ptr + expert,
         1,
@@ -276,5 +288,4 @@ def grouped_gemm(
         # get ready to go to the next gemm problem
         last_problem_end = last_problem_end + num_tiles
     """
-
 

@@ -5,12 +5,12 @@ import os
 import time
 import iris
 import torch.multiprocessing as mp
+from layers.all_to_all import custom_a2a
 
-from .layers.all_to_all import custom_a2a
 #from .layers.token_shuffle import shuffle
 #from .layers.expert import expert
 
-from .utils import alloc_counts_buffers, alloc_token_buffers
+from utils import alloc_counts_buffers, alloc_token_buffers
 
 # 4 debug only
 import time
@@ -24,16 +24,24 @@ def _spin_wait_counts(cb, world_size, timeout_s=10.0):
             raise RuntimeError(f"timeout waiting counts_ready: {v} < {world_size}")
         time.sleep(0.001)  # avoid 100% CPU
 
-def _spin_wait_tokens(tb, world_size, timeout_s=10.0):
+def _spin_wait_tokens(tb, pca, world_size, block_m: int, timeout_s=10.0):
+    pca = pca.to(torch.int32)
+    expected_tiles = ((pca + (block_m - 1)) // block_m).sum(dim=1).to(torch.int32)
+
     t0 = time.time()
     while True:
-        ok = bool(torch.all(tb.token_sync == world_size).item())
+        ok = bool(torch.all(tb.token_sync.to(torch.int32) >= expected_tiles).item())
         if ok:
             return
         if time.time() - t0 > timeout_s:
-            # print the vector to see which expert is stuck
-            raise RuntimeError(f"timeout waiting token_sync: {tb.token_sync.tolist()}")
+            raise RuntimeError(
+                f"timeout waiting token_sync:\n"
+                f"  token_sync={tb.token_sync.tolist()}\n"
+                f"  expected ={expected_tiles.tolist()}\n"
+                f"  pca_sum_per_expert={pca.sum(dim=1).tolist()}"
+            )
         time.sleep(0.001)
+
 
 
 
@@ -179,8 +187,9 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     #    pass
     #while not bool(torch.all(tb.token_sync == world_size).item()):
     #    pass
+    BLOCK_M = int(os.environ.get("TOK_BLOCK_M", "32"))
     _spin_wait_counts(cb, world_size)
-    _spin_wait_tokens(tb, world_size)
+    _spin_wait_tokens(tb, cb.pca, world_size, block_m=BLOCK_M)
 
     # gather inputs for expected mapping 
     gathered_in = [torch.empty_like(tokens) for _ in range(world_size)]
@@ -230,7 +239,7 @@ def test_gemm(total_expert_cnt, token_hid_dim, expert_hid_dim):
 
 if __name__ == '__main__':
    
-    world_size = 2
+    world_size = 8
     mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
 
 
