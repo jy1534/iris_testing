@@ -1,11 +1,12 @@
 import torch
 import torch.distributed as dist
-
+import triton
 # from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
 
 
-from .kernels import counts_exchange_kernel, tokens_exchange_kernel
-from .utils import build_expert_offsets, _assert_cuda_int32
+from kernels import counts_exchange_kernel, tokens_exchange_tiles_fused_kernel
+from utils import build_expert_offsets, _assert_cuda_int32
+
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -34,7 +35,7 @@ class AllToAllOp(torch.autograd.Function):
                       # Each remote src does atomic_add(+1, release) after writing its column of local_pca.
         token_sync,   # Stage-2 per-expert completion counters on *this* rank.
                       # Each remote src does atomic_add(+1, release) for each expert after writing token_buf.
-
+        tile_counter, # new with the new kernel
         # Heap bases pointing to symmetric memory arrays of all devices participating in EP.
         # (Used by iris.put / iris.atomic_add to address peers' symmetric allocations.)
         heap_bases,   # [world] pointer-like tensor / address list (implementation-dependent)
@@ -77,7 +78,7 @@ class AllToAllOp(torch.autograd.Function):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
-        assert experts % world_size, 'EP-group size unevenly calculated.'
+        assert experts % world_size == 0, 'EP-group size unevenly calculated.'
 
         e_local = experts // world_size
         hidden_dim = tokens.shape[-1]
@@ -96,15 +97,16 @@ class AllToAllOp(torch.autograd.Function):
         )
 
         # Stage-2: token exchange
+        BLOCK_M=32
         expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) :contentReference[oaicite:11]{index=11}
-        tokens_exchange_kernel[(world_size, e_local)](
-            tokens,
-            dest_counts,
-            dst_offsets,
-            expert_offs,
-            token_buf,
-            token_sync,
-            heap_bases,
+        max_n = int(dest_counts.max().item())
+        max_n_eff = min(max_n, capacity)          
+        max_tiles = (max_n_eff + BLOCK_M - 1) // BLOCK_M
+        max_tiles = max(1, max_tiles)
+
+        tokens_exchange_tiles_fused_kernel[(world_size, e_local, max_tiles)](
+            tokens, dest_counts, dst_offsets, expert_offs,
+            token_buf, token_sync, tile_counter, heap_bases,
             src_rank=rank,
             world_size=world_size,
             e_local=e_local,
