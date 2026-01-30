@@ -91,22 +91,20 @@ def tokens_exchange_tiles_fused_kernel(
 
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
+    # Clamp to CAP to avoid OOB if caller didn't skip overflow
+    n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
+    
     # Fast path: n==0 still must per-src ack once 
     if pid_m == 0:
-        if n == 0:
+        if n_eff == 0:
             iris.atomic_add(
-                token_sync_ptr + expert,
-                1,
-                src_rank,
-                dst,
-                heap_bases,
-                sem="release",
-                scope="sys",
+                token_sync_ptr + expert, 1,
+                src_rank, dst, heap_bases,
+                sem="release", scope="sys",
             )
             return
 
-    # expected number of row-tiles for this (dst, expert) from this src
-    expected_tiles = (n + (BLOCK_M - 1)) // BLOCK_M
+    expected_tiles = (n_eff + (BLOCK_M - 1)) // BLOCK_M
     if pid_m >= expected_tiles:
         return
 
@@ -115,9 +113,10 @@ def tokens_exchange_tiles_fused_kernel(
     send_base = dst_base + e_off
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offs_m < n
-    safe_row = tl.where(m_mask, send_base + offs_m, 0).to(tl.int32)
+    m_mask = offs_m < n_eff
 
+    safe_row = tl.where(m_mask, send_base + offs_m, 0).to(tl.int32)
+    safe_m   = tl.where(m_mask, offs_m, 0).to(tl.int32)  # NEW: avoid OOB remote ptr even if masked
     remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
 
     for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
@@ -125,7 +124,7 @@ def tokens_exchange_tiles_fused_kernel(
         k_mask = offs_k < hidden_dim
 
         send_ptrs   = send_ptr + safe_row[:, None] * hidden_dim + offs_k[None, :]
-        remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
+        remote_ptrs = token_buf_ptr + remote_base + safe_m[:, None] * hidden_dim + offs_k[None, :]
 
         iris.put(
             send_ptrs,
