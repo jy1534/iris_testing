@@ -95,14 +95,15 @@ class AllToAllOp(torch.autograd.Function):
             BLOCK_E=128,
             num_warps=4,
         )
-
+        
+        
         # Stage-2: token exchange
-        BLOCK_M=32
-        expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) :contentReference[oaicite:11]{index=11}
-        max_n = int(dest_counts.max().item())
-        max_n_eff = min(max_n, capacity)          
-        max_tiles = (max_n_eff + BLOCK_M - 1) // BLOCK_M
-        max_tiles = max(1, max_tiles)
+        #
+        # IMPORTANT: avoid dest_counts.max().item() here (device->host sync).
+        BLOCK_M = 8
+        expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) within this rank's packed send payload
+        max_tiles = (capacity + BLOCK_M - 1) // BLOCK_M  # ceil(CAP / BLOCK_M)
+        max_tiles = max(1, int(max_tiles))
 
         tokens_exchange_tiles_fused_kernel[(world_size, e_local, max_tiles)](
             tokens, dest_counts, dst_offsets, expert_offs,
@@ -112,8 +113,8 @@ class AllToAllOp(torch.autograd.Function):
             e_local=e_local,
             CAP=capacity,
             hidden_dim=hidden_dim,
-            BLOCK_M=32,
-            BLOCK_K=128,
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=256,
             num_warps=8,
         )
 

@@ -33,29 +33,35 @@ def counts_exchange_kernel(
     """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
 
     dst = tl.program_id(0)  # one program per destination rank
+   
+    
 
     # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
+       
 
         # Local read: send_counts[dst, e]
         #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer
-        remote_ptr = pca_ptr + e * world_size + src_rank
-        iris.put(
+        src_ptr = send_counts_ptr + dst * e_local + e  
+        remote_ptr = pca_ptr + e * world_size + src_rank 
+                    
+                  
+        iris.put(  
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
             to_rank=dst,
+            
             heap_bases=heap_bases,
             mask=mask_e,        
         )
-
+      
     # Signal completion to destination (release semantics).
-    iris.atomic_add(
+    iris.atomic_add( 
         counts_ready_ptr,
         1,
         src_rank,
@@ -64,6 +70,7 @@ def counts_exchange_kernel(
         sem="release",
         scope="sys",
     )
+    # spin wait on elocal variables that waits
 
 # Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
 @triton.jit
@@ -85,16 +92,17 @@ def tokens_exchange_tiles_fused_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    dst    = tl.program_id(0)
-    expert = tl.program_id(1)
-    pid_m  = tl.program_id(2)  # tile over rows
+    dst    = tl.program_id(0) 
+    expert = tl.program_id(1) 
+    pid_m  = tl.program_id(2)  
 
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
 
     # Clamp to CAP to avoid OOB if caller didn't skip overflow
     n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
-    
-    # Fast path: n==0 still must per-src ack once 
+
+
+
     if pid_m == 0:
         if n_eff == 0:
             iris.atomic_add(
@@ -118,6 +126,7 @@ def tokens_exchange_tiles_fused_kernel(
     safe_row = tl.where(m_mask, send_base + offs_m, 0).to(tl.int32)
     safe_m   = tl.where(m_mask, offs_m, 0).to(tl.int32)  # NEW: avoid OOB remote ptr even if masked
     remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
+    
 
     for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)

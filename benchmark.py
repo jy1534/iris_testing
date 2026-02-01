@@ -14,6 +14,9 @@ from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding
 
 from  layers.all_to_all import custom_a2a
 
+#import torch.cuda.profiler as cuda_profiler
+import torch.profiler
+
 WARMUP = int(os.getenv("WARMUP", "5"))
 ITERS  = int(os.getenv("ITERS", "20"))
 CHECK  = int(os.getenv("CHECK", "1"))  # 1: correctness；0:  perf/sweep
@@ -21,9 +24,21 @@ CLEAR_TOKEN_BUF  = int(os.getenv("CLEAR_TOKEN_BUF", "0"))
 SKIP_ON_OVERFLOW = int(os.getenv("SKIP_ON_OVERFLOW", "1"))
 IRIS_HEAP_GIB    = int(os.getenv("IRIS_HEAP_GIB", "100"))
 
+PROFILE_CUSTOM   = int(os.getenv("PROFILE_CUSTOM", "0")) == 1
+PROFILE_BASELINE = int(os.getenv("PROFILE_BASELINE", "0")) == 1
+PROFILE_ITERS    = int(os.getenv("PROFILE_ITERS", "3"))
+TRACE_DIR        = os.getenv("TRACE_DIR", ".")
+
+
+def nvtx_push(msg):
+    torch.cuda.nvtx.range_push(msg)
+
+def nvtx_pop():
+    torch.cuda.nvtx.range_pop()
+
+
 def mark(msg: str):
-    import time
-    # dist.get_rank() 只有在 init_process_group 之后才安全
+    # dist.get_rank() is safe only after init_process_group 
     r = dist.get_rank() if dist.is_initialized() else -1
     print(f"[{time.time():.3f}] rank{r}: {msg}", flush=True)
 
@@ -50,45 +65,228 @@ def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
 
 
 def _masked_stats(
-    triton_buf: torch.Tensor,
-    torch_buf: torch.Tensor,
+    custom_buf: torch.Tensor,
+    base_buf: torch.Tensor,
     counts_mat: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute max|diff| and sums over ONLY the valid (non-padding) region.
 
-    triton_buf/torch_buf: [E, world, CAP, H]
+    custom_buf/base_buf: [E, world, CAP, H]
     counts_mat:           [E, world]  (counts_mat[e, src] = number of valid rows)
 
-    Returns: (max_diff, sum_triton, sum_torch) as 0-dim float32 tensors on GPU.
+    Returns: (max_diff, sum_custom, sum_base) as 0-dim float32 tensors on GPU.
     """
-    assert triton_buf.shape == torch_buf.shape
-    E, W, CAP, H = triton_buf.shape
+    assert custom_buf.shape == base_buf.shape
+    E, W, CAP, H = custom_buf.shape
 
     # mask[e, src, m] = (m < counts_mat[e, src])
-    m = torch.arange(CAP, device=triton_buf.device, dtype=torch.int32)[None, None, :]
+    m = torch.arange(CAP, device=custom_buf.device, dtype=torch.int32)[None, None, :]
     mask = (m < counts_mat.to(torch.int32)[:, :, None]).unsqueeze(-1)  # [E, W, CAP, 1]
 
-    diff = (triton_buf - torch_buf).abs().to(torch.float32)
+    diff = (custom_buf - base_buf).abs().to(torch.float32)
     diff_masked = diff * mask.to(torch.float32)
 
     max_diff = diff_masked.max()
 
-    sum_triton = (triton_buf.to(torch.float32) * mask.to(torch.float32)).sum()
-    sum_torch = (torch_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+    sum_custom = (custom_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+    sum_base = (base_buf.to(torch.float32) * mask.to(torch.float32)).sum()
 
-    return max_diff, sum_triton, sum_torch
+    return max_diff, sum_custom, sum_base
 
 # judging and checking cap
-def _allreduce_max_i32(x):
+def _allreduce_max_i32(x: torch.Tensor) -> torch.Tensor:
     y = x.clone()
     dist.all_reduce(y, op=dist.ReduceOp.MAX)
     return y
 
-def _allreduce_min_i32(x):
+
+def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
     y = x.clone()
     dist.all_reduce(y, op=dist.ReduceOp.MIN)
     return y
 
+def _wait_counts_ready(counts_ready: torch.Tensor, world_size: int, sleep_s: float = 0.0, timeout_s: float = 10.0) -> None:
+    assert counts_ready.numel() == 1
+    t0 = time.time()
+    while True:
+        if int(counts_ready.item()) >= int(world_size):
+             return
+        if (time.time() - t0) > timeout_s:
+            v = int(counts_ready.item())
+            r = dist.get_rank() if dist.is_initialized() else -1
+            raise RuntimeError(f"[rank{r}] wait_counts_ready TIMEOUT: {v} < {world_size}")
+        if sleep_s:
+            time.sleep(sleep_s)
+
+def _wait_token_sync(token_sync: torch.Tensor, world_size: int, sleep_s: float = 0.0, timeout_s: float = 10.0) -> None:
+    t0 = time.time()
+    while True:
+        vals = token_sync.detach().cpu()
+        if bool((vals >= int(world_size)).all()):
+            return
+        if (time.time() - t0) > timeout_s:
+            r = dist.get_rank() if dist.is_initialized() else -1
+            vmin = int(vals.min().item())
+            argmin = int(vals.argmin().item())
+            raise RuntimeError(f"[rank{r}] wait_token_sync TIMEOUT: min={vmin} < {world_size} at expert={argmin}, vals={vals.tolist()}")
+        if sleep_s:
+            time.sleep(sleep_s)
+
+
+
+# Profile pass (separate from perf timing) so the timing loop is good
+
+def _profile_pass_custom(
+    rank: int,
+    shmem,
+    buffers,
+    send_payload,
+    send_counts,
+    dst_offsets,
+    num_experts_total: int,
+    capacity: int,
+):
+    world_size = dist.get_world_size()
+    # All ranks run the same ops; only rank0 records trace.
+    do_trace = (rank == 0) and PROFILE_CUSTOM
+    trace_path = os.path.join(TRACE_DIR, f"trace_custom_rank{rank}.json")
+
+    if do_trace:
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        prof.__enter__()
+    else:
+        prof = None
+
+    try:
+        for i in range(PROFILE_ITERS):
+            # Keep profile deterministic: reset + order
+            buffers.pca.zero_()
+            buffers.counts_ready.zero_()
+            buffers.token_sync.zero_()
+            buffers.tile_counter.zero_()
+            if CLEAR_TOKEN_BUF:
+                buffers.token_buf.zero_()
+            shmem.barrier()
+            # Keep the ops identical across ranks.
+            if do_trace:
+                with torch.profiler.record_function(f"custom_prof_iter_{i}"):
+                    _ = custom_a2a(
+                        send_payload,
+                        send_counts,
+                        dst_offsets,
+                        buffers.pca,
+                        buffers.token_buf,
+                        buffers.counts_ready,
+                        buffers.token_sync,
+                        buffers.tile_counter,
+                        buffers.heap_bases,
+                        num_experts_total,
+                        capacity,
+                    )
+                    #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
+                    #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
+                    shmem.barrier()
+                prof.step()
+            else:
+                _ = custom_a2a(
+                    send_payload,
+                    send_counts,
+                    dst_offsets,
+                    buffers.pca,
+                    buffers.token_buf,
+                    buffers.counts_ready,
+                    buffers.token_sync,
+                    buffers.tile_counter,
+                    buffers.heap_bases,
+                    num_experts_total,
+                    capacity,
+                )
+                #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
+                #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
+                shmem.barrier()
+    finally:
+        if do_trace and prof is not None:
+            prof.__exit__(None, None, None)
+            prof.export_chrome_trace(trace_path)
+            print(f"[trace] wrote {trace_path}", flush=True)
+
+
+def _profile_pass_baseline(
+    rank: int,
+    world_size: int,
+    e_local: int,
+    capacity: int,
+    hidden_dim: int,
+    send_payload,
+    send_counts,
+    base_buffers_perf,
+):
+    # IMPORTANT: baseline has collectives inside -> ALL ranks must execute.
+    do_trace = (rank == 0) and PROFILE_BASELINE
+    trace_path = os.path.join(TRACE_DIR, f"trace_baseline_rank{rank}.json")
+
+    if do_trace:
+        os.makedirs(TRACE_DIR, exist_ok=True)
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        prof.__enter__()
+    else:
+        prof = None
+
+    try:
+        for i in range(PROFILE_ITERS):
+            # Keep profile deterministic: reset + order
+           
+            if do_trace:
+                with torch.profiler.record_function(f"baseline_prof_iter_{i}"):
+                    _ = run_baseline_ref(
+                        rank=rank,
+                        world_size=world_size,
+                        e_local=e_local,
+                        capacity=capacity,
+                        hidden_dim=hidden_dim,
+                        send_payload=send_payload,
+                        send_counts=send_counts,
+                        buffers=base_buffers_perf,
+                        do_reorder=False,       # COMM-only
+                        profile=False,
+                        strict_capacity=False,
+                        barrier=False,
+                    )
+                    
+                prof.step()
+            else:
+                _ = run_baseline_ref(
+                    rank=rank,
+                    world_size=world_size,
+                    e_local=e_local,
+                    capacity=capacity,
+                    hidden_dim=hidden_dim,
+                    send_payload=send_payload,
+                    send_counts=send_counts,
+                    buffers=base_buffers_perf,
+                    do_reorder=False,       # COMM-only
+                    profile=False,
+                    strict_capacity=False,
+                    barrier=False,
+                )
+    finally:
+        if do_trace and prof is not None:
+            prof.__exit__(None, None, None)
+            prof.export_chrome_trace(trace_path)
+            print(f"[trace] wrote {trace_path}", flush=True)
 
 
 
@@ -179,6 +377,8 @@ def check_compare(
         buffers.tile_counter.zero_() 
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
+        shmem.barrier()
+
 
         _ = custom_a2a(
             send_payload,
@@ -193,11 +393,13 @@ def check_compare(
             num_experts_total,
             capacity,
         )
+        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
+        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
         shmem.barrier()
 
-    mark("A: before warmup dist.barrier")
+    #mark("A: before warmup dist.barrier")
     dist.barrier()
-    mark("A: after warmup dist.barrier")
+    #mark("A: after warmup dist.barrier")
     torch.cuda.synchronize()
 
 
@@ -207,7 +409,7 @@ def check_compare(
     for i in range(WARMUP):
     #for _ in range(WARMUP):
         try:
-            mark(f"B: before baseline warmup iter={i} (NCCL collective inside)")
+            #mark(f"B: before baseline warmup iter={i} (NCCL collective inside)")
             _ = run_baseline_ref(
                 rank=rank,
                 world_size=world_size,
@@ -222,7 +424,7 @@ def check_compare(
                 strict_capacity=False,   # perf: don't throw
                 barrier=False,           # we sync outside consistently
             )
-            mark(f"B: after baseline warmup iter={i}")
+            #mark(f"B: after baseline warmup iter={i}")
         except Exception as e:
             ok.zero_()
             warmup_err = repr(e)
@@ -238,25 +440,26 @@ def check_compare(
         return
 
     # Align start (do once not in per-iter)
-    mark("B2: before post-baseline-warmup dist.barrier")
+    #mark("B2: before post-baseline-warmup dist.barrier")
     dist.barrier()
-    mark("B2: after post-baseline-warmup dist.barrier")
+    #mark("B2: after post-baseline-warmup dist.barrier")
     torch.cuda.synchronize()
 
     custom_times = []
+
     for i in range(ITERS):
-    #for _ in range(ITERS):
         buffers.pca.zero_()
         buffers.counts_ready.zero_()
         buffers.token_sync.zero_()
-        buffers.tile_counter.zero_() 
+        buffers.tile_counter.zero_()
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
+        shmem.barrier()
 
-        mark(f"C: before custom_a2a iter={i}")
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        
+
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -270,17 +473,14 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-
-        # signaling the over of certain rank
-        mark(f"C: after custom_a2a iter={i} (before shmem.barrier)")
+        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
+        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
         shmem.barrier()
-        mark(f"C2: after shmem.barrier iter={i}")
-        torch.cuda.synchronize()
 
+        torch.cuda.synchronize()
         t1 = time.perf_counter()
         custom_times.append((t1 - t0) * 1e3)
 
-    
     
 
     # Timed baseline — per-iter timing, sync semantics: safe barrier + cuda sync
@@ -291,7 +491,7 @@ def check_compare(
     baseline_times = []
     timed_err = None
     ok.fill_(1)
-    failed = False
+    
     #for _ in range(ITERS):
     #    if failed:
     #        continue # continue while failed
@@ -299,7 +499,7 @@ def check_compare(
         try:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            mark(f"B: before baseline timed iter={i} (NCCL collective inside)")
+            #mark(f"B: before baseline timed iter={i} (NCCL collective inside)")
             _ = run_baseline_ref(
                 rank=rank,
                 world_size=world_size,
@@ -314,7 +514,7 @@ def check_compare(
                 strict_capacity=False,
                 barrier=False,   # in baseline no barrier
             )
-            mark(f"B: after baseline timed iter={i}")
+            #mark(f"B: after baseline timed iter={i}")
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             baseline_times.append((t1 - t0) * 1e3)
@@ -352,9 +552,42 @@ def check_compare(
         print(f"speedup (baseline/custom):   {base_ms_max.item()/custom_ms_max.item():.3f}x")
 
 
-    # 
+
+# Separate profile passes (NOT included in perf timing)
+   
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    if PROFILE_CUSTOM:
+        _profile_pass_custom(
+            rank,
+            shmem,
+            buffers,
+            send_payload,
+            send_counts,
+            dst_offsets,
+            num_experts_total,
+            capacity,
+        )
+
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    if PROFILE_BASELINE:
+        _profile_pass_baseline(
+            rank,
+            world_size,
+            e_local,
+            capacity,
+            hidden_dim,
+            send_payload,
+            send_counts,
+            base_buffers_perf,
+        )
+
+    
     # Correctness: run once, strict
-    # 
+    
     if CHECK:
         dist.barrier()
         torch.cuda.synchronize()
@@ -373,6 +606,7 @@ def check_compare(
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
 
+        shmem.barrier()
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -386,6 +620,8 @@ def check_compare(
             num_experts_total,
             capacity,
         )
+        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
+        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
         shmem.barrier()
         torch.cuda.synchronize()
 
@@ -455,7 +691,7 @@ if __name__ == "__main__":
     hidden_dim = int(os.getenv("HIDDEN", "4096"))
     topk       = int(os.getenv("TOPK", "2"))
     e_local    = int(os.getenv("E_LOCAL", "4"))
-    capacity   = int(os.getenv("CAPACITY", "1024"))
+    capacity   = int(os.getenv("CAPACITY", "8096"))
     seed       = int(os.getenv("SEED", "42")) # random ssed
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
